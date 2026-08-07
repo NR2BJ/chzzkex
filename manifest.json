@@ -1,0 +1,76 @@
+{
+  "manifest_version": 3,
+  "name": "CHZZK EX",
+  "short_name": "CHZZK EX",
+  "description": "Playback, navigation, and chat conveniences for CHZZK.",
+  "version": "1.0.0",
+  "permissions": [
+    "declarativeNetRequest",
+    "storage"
+  ],
+  "host_permissions": [
+    "https://chzzk.naver.com/*",
+    "https://*.chzzk.naver.com/*",
+    "https://api.chzzk.naver.com/*",
+    "https://apis.naver.com/*"
+  ],
+  "content_scripts": [
+    {
+      "matches": [
+        "https://chzzk.naver.com/*",
+        "https://*.chzzk.naver.com/*"
+      ],
+      "js": [
+        "src/settings.js",
+        "src/content.js"
+      ],
+      "run_at": "document_start"
+    },
+    {
+      "matches": [
+        "https://chzzk.naver.com/*",
+        "https://*.chzzk.naver.com/*"
+      ],
+      "css": [
+        "src/playback.css",
+        "src/features.css"
+      ],
+      "js": [
+        "src/settings.js",
+        "src/rewrite-core.js",
+        "src/injected.js",
+        "src/feature-core.js",
+        "src/features.js"
+      ],
+      "run_at": "document_start",
+      "world": "MAIN"
+    }
+  ],
+  "declarative_net_request": {
+    "rule_resources": [
+      {
+        "id": "runtime_rules",
+        "enabled": true,
+        "path": "rules/chzzk.json"
+      }
+    ]
+  },
+  "action": {
+    "default_title": "CHZZK EX",
+    "default_popup": "popup/popup.html"
+  },
+  "browser_specific_settings": {
+    "gecko": {
+      "id": "chzzkex@example.local",
+      "strict_min_version": "140.0",
+      "data_collection_permissions": {
+        "required": [
+          "none"
+        ]
+      }
+    },
+    "gecko_android": {
+      "strict_min_version": "142.0"
+    }
+  }
+}

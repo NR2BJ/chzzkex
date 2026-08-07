@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="ko">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>CHZZK EX</title>
+    <link rel="stylesheet" href="popup.css">
+  </head>
+  <body>
+    <main class="panel">
+      <header class="header">
+        <div>
+          <h1>CHZZK EX</h1>
+          <p>Viewer tools</p>
+        </div>
+        <span id="status" class="status">ON</span>
+      </header>
+
+      <section>
+        <h2>재생</h2>
+        <label class="toggle">
+          <span><strong>실시간 음량 맞춤</strong><small>플레이어 볼륨을 유지하고 현재 방송 평균 조정</small></span>
+          <input id="normalizeVolume" type="checkbox" role="switch">
+        </label>
+        <div id="normalizationMaxBoost" class="number-setting">
+          <strong>최대 증폭</strong>
+          <label class="number-field">
+            <input id="normalizationMaxBoostDb" type="number" min="0" max="60" step="1" inputmode="numeric">
+            <span>dB</span>
+          </label>
+        </div>
+        <label class="toggle">
+          <span><strong>다이내믹 압축</strong><small>큰 말소리와 게임 효과음을 완만하게 조정</small></span>
+          <input id="compressAudio" type="checkbox" role="switch">
+        </label>
+        <div id="compressorPreset" class="preset-setting">
+          <strong>압축 강도</strong>
+          <div class="segmented" role="radiogroup" aria-label="압축 강도">
+            <label><input type="radio" name="compressorPreset" value="light"><span>약</span></label>
+            <label><input type="radio" name="compressorPreset" value="medium"><span>중</span></label>
+            <label><input type="radio" name="compressorPreset" value="strong"><span>강</span></label>
+          </div>
+        </div>
+        <label class="toggle">
+          <span><strong>타임라인 보조</strong><small>기본 바가 숨겨지면 보조 타임라인 표시</small></span>
+          <input id="timelineAssist" type="checkbox" role="switch">
+        </label>
+        <label class="toggle">
+          <span><strong>시청 타이머</strong><small>현재 방송의 실제 재생 시간 표시</small></span>
+          <input id="watchTimer" type="checkbox" role="switch">
+        </label>
+      </section>
+
+      <section>
+        <h2>탐색</h2>
+        <label class="toggle">
+          <span><strong>팔로잉 자동 갱신</strong><small>팔로잉 목록을 30초마다 갱신</small></span>
+          <input id="followingAutoRefresh" type="checkbox" role="switch">
+        </label>
+        <label class="toggle">
+          <span><strong>사이드바 미리보기</strong><small>방송 위에 올리면 썸네일과 현재 정보 표시</small></span>
+          <input id="sidebarPreview" type="checkbox" role="switch">
+        </label>
+      </section>
+
+      <section>
+        <h2>채팅</h2>
+        <label class="toggle">
+          <span><strong>정확한 채팅 시각</strong><small>메시지마다 HH:MM:SS 표시</small></span>
+          <input id="chatTimestamp" type="checkbox" role="switch">
+        </label>
+        <label class="toggle">
+          <span><strong>재생 상태 표시</strong><small>LIVE까지 남은 시간, 미리 받은 분량, 음량 상태 표시</small></span>
+          <input id="videoLatency" type="checkbox" role="switch">
+        </label>
+        <label class="toggle">
+          <span><strong>투명 닉네임 복구</strong></span>
+          <input id="restoreTransparentNicknames" type="checkbox" role="switch">
+        </label>
+        <label class="toggle">
+          <span><strong>블라인드 메시지 복구</strong><small>페이지에 남아 있는 원문만 복구</small></span>
+          <input id="restoreBlindedMessages" type="checkbox" role="switch">
+        </label>
+      </section>
+
+      <section>
+        <h2>자동화</h2>
+        <label class="toggle">
+          <span><strong>통나무 파워 자동 수령</strong></span>
+          <input id="autoClaimPower" type="checkbox" role="switch">
+        </label>
+      </section>
+
+      <section class="developer-section">
+        <label class="toggle compact">
+          <span><strong>디버그 로그</strong></span>
+          <input id="debug" type="checkbox" role="switch">
+        </label>
+      </section>
+    </main>
+    <script src="../src/settings.js"></script>
+    <script src="popup.js"></script>
+  </body>
+</html>

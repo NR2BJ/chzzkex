@@ -1,0 +1,106 @@
+import { createHash } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import {
+  copyFile,
+  cp,
+  mkdir,
+  readFile,
+  rm,
+  stat,
+  writeFile
+} from "node:fs/promises";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
+const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
+const distDir = path.join(rootDir, "dist");
+const stageDir = path.join(distDir, ".stage");
+const runtimeEntries = ["NOTICE.md", "popup", "rules", "src"];
+const manifest = JSON.parse(
+  await readFile(path.join(rootDir, "manifest.json"), "utf8")
+);
+const version = manifest.version;
+
+if (!/^\d+\.\d+\.\d+$/.test(version)) {
+  throw new Error(`Unsupported manifest version: ${version}`);
+}
+
+await mkdir(distDir, { recursive: true });
+await rm(stageDir, { recursive: true, force: true });
+await mkdir(stageDir, { recursive: true });
+
+async function stageRuntime(browser) {
+  const browserDir = path.join(stageDir, browser);
+  await mkdir(browserDir, { recursive: true });
+
+  for (const entry of runtimeEntries) {
+    const source = path.join(rootDir, entry);
+    const destination = path.join(browserDir, entry);
+    const sourceStat = await stat(source);
+
+    if (sourceStat.isDirectory()) {
+      await cp(source, destination, { recursive: true });
+    } else {
+      await copyFile(source, destination);
+    }
+  }
+
+  const browserManifest = JSON.parse(JSON.stringify(manifest));
+  if (browser === "chrome") {
+    delete browserManifest.browser_specific_settings;
+  }
+
+  await writeFile(
+    path.join(browserDir, "manifest.json"),
+    `${JSON.stringify(browserManifest, null, 2)}\n`,
+    "utf8"
+  );
+
+  return browserDir;
+}
+
+function makeArchive(sourceDir, archivePath) {
+  const result = spawnSync(
+    "zip",
+    ["-X", "-q", "-r", archivePath, "manifest.json", ...runtimeEntries],
+    { cwd: sourceDir, encoding: "utf8" }
+  );
+
+  if (result.status !== 0) {
+    throw new Error(result.stderr || result.stdout || "zip failed");
+  }
+}
+
+async function sha256(filePath) {
+  const hash = createHash("sha256");
+  hash.update(await readFile(filePath));
+  return hash.digest("hex");
+}
+
+const chromeName = `chzzk-ex-chrome-v${version}.zip`;
+const firefoxName = `chzzk-ex-firefox-v${version}.xpi`;
+const chromePath = path.join(distDir, chromeName);
+const firefoxPath = path.join(distDir, firefoxName);
+
+await Promise.all([
+  rm(chromePath, { force: true }),
+  rm(firefoxPath, { force: true })
+]);
+makeArchive(await stageRuntime("chrome"), chromePath);
+makeArchive(await stageRuntime("firefox"), firefoxPath);
+
+const checksums = [
+  `${await sha256(chromePath)}  ${chromeName}`,
+  `${await sha256(firefoxPath)}  ${firefoxName}`
+];
+await writeFile(
+  path.join(distDir, "SHA256SUMS.txt"),
+  `${checksums.join("\n")}\n`,
+  "utf8"
+);
+
+await rm(stageDir, { recursive: true, force: true });
+
+for (const fileName of [chromeName, firefoxName, "SHA256SUMS.txt"]) {
+  console.log(path.join("dist", fileName));
+}

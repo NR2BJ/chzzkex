@@ -1,0 +1,217 @@
+const test = require("node:test");
+const assert = require("node:assert/strict");
+const core = require("../src/feature-core.js");
+
+test("formats stopwatch duration without wrapping after 24 hours", () => {
+  assert.equal(core.formatDuration(0), "00:00:00");
+  assert.equal(core.formatDuration(3661.9), "01:01:01");
+  assert.equal(core.formatDuration(90061), "25:01:01");
+});
+
+test("formats the effective player volume as a percentage", () => {
+  assert.equal(core.formatVolumePercent(0.456), "46%");
+  assert.equal(core.formatVolumePercent(2), "100%");
+  assert.equal(core.formatVolumePercent(-1), "0%");
+  assert.equal(core.formatVolumePercent(0.8, true), "0%");
+});
+
+test("formats relative timeline offsets", () => {
+  assert.equal(core.formatOffset(0), "-00:00");
+  assert.equal(core.formatOffset(89.5), "-01:30");
+  assert.equal(core.formatOffset(3661), "-1:01:01");
+});
+
+test("formats an exact local chat timestamp", () => {
+  const date = new Date(2026, 7, 6, 9, 5, 7);
+  assert.equal(core.formatTimestamp(date.getTime()), "09:05:07");
+  assert.equal(core.formatTimestamp("invalid"), "");
+});
+
+test("keeps a timeline position fixed against a continuously advancing live edge", () => {
+  const initialEdge = core.projectLiveEdge(100, 0);
+  const laterEdge = core.projectLiveEdge(100, 30);
+  assert.equal(initialEdge - 10, 90);
+  assert.equal(laterEdge - 40, 90);
+  assert.equal(core.timelineProgress(initialEdge - 10, 120), 0.25);
+  assert.equal(core.timelineProgress(laterEdge - 40, 120), 0.25);
+});
+
+test("distinguishes live playback from an intentional timeline rewind", () => {
+  assert.equal(core.isAtLiveEdge(false, true, 12), true);
+  assert.equal(core.isAtLiveEdge(false, false, 3.5), true);
+  assert.equal(core.isAtLiveEdge(false, false, 45), false);
+  assert.equal(core.isAtLiveEdge(true, true, 1), false);
+});
+
+test("maps the custom bar to seconds behind the projected live edge", () => {
+  assert.equal(core.timelineSeekTarget(10, 100, 100, 90, 0), 10);
+  assert.equal(core.timelineSeekTarget(10, 100, 100, 90, 0.5), 55);
+  assert.equal(core.timelineSeekTarget(10, 100, 100, 90, 1), 99.75);
+  assert.equal(core.timelineSeekTarget(40, 130, 132, 90, 0), 42);
+  assert.equal(core.timelineSeekTarget(10, 10, 10, 90, 0.5), null);
+});
+
+test("recognizes only a genuinely visible native timeline", () => {
+  assert.equal(
+    core.hasUsableNativeTimeline([
+      { display: "none", visibility: "visible", width: 0, height: 0 }
+    ]),
+    false
+  );
+  assert.equal(
+    core.hasUsableNativeTimeline([
+      { display: "block", visibility: "visible", width: 800, height: 14 }
+    ]),
+    true
+  );
+  assert.equal(
+    core.hasUsableNativeTimeline([
+      {
+        custom: true,
+        display: "grid",
+        visibility: "visible",
+        width: 800,
+        height: 26
+      }
+    ]),
+    false
+  );
+});
+
+test("gated loudness ignores silence and quiet outliers", () => {
+  const blocks = [-60, -20, -20, -21].map(core.energyFromLoudnessDb);
+  const loudnessDb = core.gatedLoudnessDb(blocks);
+  assert.ok(loudnessDb > -21 && loudnessDb < -19.5);
+  assert.equal(core.gatedLoudnessDb([]), null);
+});
+
+test("normalization gain uses the louder target and configurable boost cap", () => {
+  assert.equal(core.normalizationGainDb({ loudnessDb: -30 }), 12);
+  assert.equal(core.normalizationGainDb({ loudnessDb: -30, maximumDb: 3 }), 3);
+  assert.equal(core.normalizationGainDb({ loudnessDb: -40, maximumDb: 60 }), 26);
+  assert.equal(core.normalizationGainDb({ loudnessDb: -4 }), -10);
+  assert.equal(core.normalizationGainDb({ loudnessDb: 0 }), -12);
+  assert.equal(core.normalizationGainDb({ loudnessDb: -14 }), 0);
+});
+
+test("normalization measures source loudness independently of player volume", () => {
+  const sourceEnergy = core.energyFromLoudnessDb(-20);
+  const measured = core.sourceLevelBeforeMediaVolume(
+    sourceEnergy * 0.25,
+    0.2,
+    0.5
+  );
+
+  assert.ok(Math.abs(core.loudnessDbFromEnergy(measured.energy) - -20) < 0.001);
+  assert.equal(measured.peak, 0.4);
+  assert.equal(core.sourceLevelBeforeMediaVolume(0, 0, 0), null);
+  assert.equal(core.sourceLevelBeforeMediaVolume(sourceEnergy, 0.4, 1, true), null);
+});
+
+test("adaptive loudness trims rare quiet and loud blocks", () => {
+  const loudnessBlocks = [
+    ...Array(5).fill(-55),
+    ...Array(96).fill(-22),
+    ...Array(4).fill(-4)
+  ];
+  const stats = core.adaptiveLoudnessStats(
+    loudnessBlocks.map(core.energyFromLoudnessDb)
+  );
+
+  assert.ok(stats.loudnessDb > -22.2 && stats.loudnessDb < -21.8);
+  assert.ok(stats.medianDb > -22.1 && stats.medianDb < -21.9);
+  assert.equal(stats.sampleCount, 100);
+});
+
+test("short-term safety only lowers the long-term gain ceiling", () => {
+  assert.equal(
+    core.normalizationSafetyCeilingDb({
+      shortTermLoudnessDb: -24,
+      renderedPeakDb: -18
+    }),
+    12
+  );
+  assert.equal(
+    core.normalizationSafetyCeilingDb({
+      shortTermLoudnessDb: -24,
+      renderedPeakDb: -18,
+      maximumDb: 30
+    }),
+    13
+  );
+  assert.equal(
+    core.normalizationSafetyCeilingDb({
+      shortTermLoudnessDb: -10,
+      renderedPeakDb: -18
+    }),
+    -1
+  );
+  assert.equal(
+    core.normalizationSafetyCeilingDb({
+      shortTermLoudnessDb: -24,
+      renderedPeakDb: -12
+    }),
+    9
+  );
+  assert.equal(
+    core.normalizationSafetyCeilingDb({
+      shortTermLoudnessDb: -24,
+      renderedPeakDb: -1
+    }),
+    0
+  );
+  assert.ok(Math.abs(core.maximumPeakDb([0, 0.25, 0.5]) + 6.0206) < 0.001);
+  assert.equal(core.maximumPeakDb([]), Number.NEGATIVE_INFINITY);
+});
+
+test("converts the K-weighting high-pass Q to the Web Audio dB unit", () => {
+  assert.ok(
+    Math.abs(core.biquadQDbFromLinear(0.5003270373) - -6.01492055) < 1e-7
+  );
+  assert.equal(core.biquadQDbFromLinear(0), 0);
+});
+
+test("adaptive gain ignores small changes and lowers faster than it raises", () => {
+  assert.equal(core.stepAdaptiveGainDb(2, 2.5), 2);
+  assert.equal(core.stepAdaptiveGainDb(2, 4), 2.25);
+  assert.equal(core.stepAdaptiveGainDb(2, -2), 1);
+  assert.equal(core.stepAdaptiveGainDb(2, 1.4), 2);
+});
+
+test("reports the player-selected latency mode without changing it", () => {
+  assert.equal(core.trackLatencyMode({ kind: "low-latency" }), "LL");
+  assert.equal(core.trackLatencyMode({ kind: "low-latency-main" }), "LL");
+  assert.equal(core.trackLatencyMode({ kind: "main" }), "일반");
+  assert.equal(core.trackLatencyMode(null), "");
+});
+
+test("detects transparent computed colors", () => {
+  assert.equal(core.colorAlpha("transparent"), 0);
+  assert.equal(core.colorAlpha("rgba(20, 21, 23, 0)"), 0);
+  assert.equal(core.colorAlpha("rgba(20, 21, 23, 0.5)"), 0.5);
+  assert.equal(core.colorAlpha("rgb(20, 21, 23)"), 1);
+});
+
+test("chat lookup stays inside the current React item", () => {
+  const current = {
+    time: 1000,
+    content: "current",
+    originalContent: "current"
+  };
+  const adjacent = {
+    time: 2000,
+    content: "adjacent",
+    originalContent: "adjacent"
+  };
+  const fiber = {
+    child: { pendingProps: { chatMessage: current } },
+    sibling: { pendingProps: { chatMessage: adjacent } },
+    return: { memoizedProps: { chatMessage: adjacent } }
+  };
+
+  assert.equal(core.findContainedChatMessage(fiber), current);
+  assert.equal(
+    core.findContainedChatMessage({ sibling: { pendingProps: { chatMessage: adjacent } } }),
+    null
+  );
+});

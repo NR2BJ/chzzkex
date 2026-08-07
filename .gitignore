@@ -1,0 +1,5 @@
+.DS_Store
+dist/
+_metadata/
+*.zip
+worklog.md
