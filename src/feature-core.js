@@ -147,6 +147,12 @@
     };
   }
 
+  function shouldResetLoudnessMeasurement(previousRoute, nextRoute) {
+    const previous = String(previousRoute || "");
+    const next = String(nextRoute || "");
+    return Boolean(next && next !== previous);
+  }
+
   function compressorThresholdForMediaVolume(
     thresholdDb,
     volume,
@@ -575,6 +581,7 @@
     projectLiveEdge,
     timelineProgress,
     sourceLevelBeforeMediaVolume,
+    shouldResetLoudnessMeasurement,
     stepAdaptiveGainDb,
     timedSampleValues,
     trackLatencyMode

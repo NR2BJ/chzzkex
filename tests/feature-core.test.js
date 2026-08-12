@@ -15,6 +15,13 @@ test("formats the effective player volume as a percentage", () => {
   assert.equal(core.formatVolumePercent(0.8, true), "0%");
 });
 
+test("keeps loudness measurements while live playback continues on home", () => {
+  assert.equal(core.shouldResetLoudnessMeasurement("channel-a", ""), false);
+  assert.equal(core.shouldResetLoudnessMeasurement("channel-a", "channel-a"), false);
+  assert.equal(core.shouldResetLoudnessMeasurement("channel-a", "channel-b"), true);
+  assert.equal(core.shouldResetLoudnessMeasurement("", "channel-a"), true);
+});
+
 test("formats relative timeline offsets", () => {
   assert.equal(core.formatOffset(0), "-00:00");
   assert.equal(core.formatOffset(89.5), "-01:30");

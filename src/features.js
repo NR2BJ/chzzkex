@@ -98,8 +98,13 @@
   }
 
   function mainVideo() {
+    const currentChannel = channelIdFromLocation();
+    const cachedChannel = cachedMainVideoRoute.match(
+      /^\/live\/([a-z0-9_-]+)/i
+    )?.[1];
     if (
-      cachedMainVideoRoute === location.pathname &&
+      (cachedMainVideoRoute === location.pathname ||
+        (!currentChannel && cachedChannel)) &&
       cachedMainVideo?.isConnected &&
       !cachedMainVideo.closest(AUXILIARY_VIDEO_SELECTOR) &&
       cachedMainVideo.readyState >= HTMLMediaElement.HAVE_METADATA
@@ -920,7 +925,7 @@
       if (video === this.video) {
         this.configureCompressor();
         this.configureLimiter();
-        if (route !== this.route) {
+        if (core.shouldResetLoudnessMeasurement(this.route, route)) {
           this.resetMeasurement(route);
         }
         return;
@@ -948,7 +953,7 @@
         this.peakSampleBuffers = graph.peakAnalysers.map(
           (analyser) => new Float32Array(analyser.fftSize)
         );
-        if (route !== this.route) {
+        if (core.shouldResetLoudnessMeasurement(this.route, route)) {
           this.resetMeasurement(route);
         } else {
           this.applyGain(this.gainDb, 0.2);
