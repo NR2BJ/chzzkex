@@ -90,8 +90,130 @@ test("normalization gain uses the louder target and configurable boost cap", () 
   assert.equal(core.normalizationGainDb({ loudnessDb: -30, maximumDb: 3 }), 3);
   assert.equal(core.normalizationGainDb({ loudnessDb: -40, maximumDb: 60 }), 26);
   assert.equal(core.normalizationGainDb({ loudnessDb: -4 }), -10);
-  assert.equal(core.normalizationGainDb({ loudnessDb: 0 }), -12);
+  assert.equal(core.normalizationGainDb({ loudnessDb: 0 }), -14);
   assert.equal(core.normalizationGainDb({ loudnessDb: -14 }), 0);
+});
+
+test("hybrid normalization combines integrated, short-term, and peak limits", () => {
+  assert.deepEqual(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -30,
+      shortTermLoudnessDb: -18,
+      peakDb: -6
+    }),
+    {
+      gainDb: 3,
+      integratedGainDb: 14,
+      shortTermLimitDb: 6,
+      peakLimitDb: 3,
+      effectiveMaximumDb: 12
+    }
+  );
+  assert.equal(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -16,
+      shortTermLoudnessDb: -12,
+      peakDb: -3
+    }).gainDb,
+    0
+  );
+  assert.equal(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -11,
+      shortTermLoudnessDb: -8,
+      peakDb: -1
+    }).gainDb,
+    -5
+  );
+  assert.equal(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -24,
+      shortTermLoudnessDb: -20,
+      peakDb: -12
+    }).gainDb,
+    8
+  );
+  assert.equal(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -32,
+      shortTermLoudnessDb: -30,
+      peakDb: -20,
+      anchorConfirmed: false
+    }).gainDb,
+    6
+  );
+  assert.equal(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -32,
+      shortTermLoudnessDb: -30,
+      peakDb: -20,
+      maximumDb: 3,
+      anchorConfirmed: false
+    }).gainDb,
+    3
+  );
+  assert.equal(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -22,
+      shortTermLoudnessDb: -20,
+      peakDb: -10,
+      targetDb: -20
+    }).gainDb,
+    2
+  );
+  assert.equal(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -5,
+      shortTermLoudnessDb: -3,
+      peakDb: -1,
+      targetDb: -24
+    }).gainDb,
+    -19
+  );
+  assert.equal(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -5,
+      shortTermLoudnessDb: -3,
+      peakDb: -1,
+      targetDb: -60
+    }).gainDb,
+    -55
+  );
+});
+
+test("normalization confirms a useful anchor by level, contrast, or peak", () => {
+  assert.equal(
+    core.normalizationAnchorConfirmed({
+      shortTermLoudnessDb: -23,
+      medianLoudnessDb: -25,
+      peakDb: -18
+    }),
+    true
+  );
+  assert.equal(
+    core.normalizationAnchorConfirmed({
+      shortTermLoudnessDb: -27,
+      medianLoudnessDb: -34,
+      peakDb: -18
+    }),
+    true
+  );
+  assert.equal(
+    core.normalizationAnchorConfirmed({
+      shortTermLoudnessDb: -30,
+      medianLoudnessDb: -30,
+      peakDb: -10
+    }),
+    true
+  );
+  assert.equal(
+    core.normalizationAnchorConfirmed({
+      shortTermLoudnessDb: -30,
+      medianLoudnessDb: -31,
+      peakDb: -18
+    }),
+    false
+  );
 });
 
 test("normalization measures source loudness independently of player volume", () => {
@@ -108,7 +230,54 @@ test("normalization measures source loudness independently of player volume", ()
   assert.equal(core.sourceLevelBeforeMediaVolume(sourceEnergy, 0.4, 1, true), null);
 });
 
-test("adaptive loudness trims rare quiet and loud blocks", () => {
+test("compressor threshold follows player volume before source correction", () => {
+  assert.equal(core.compressorThresholdForMediaVolume(-18, 1), -18);
+  assert.ok(
+    Math.abs(core.compressorThresholdForMediaVolume(-18, 0.5) - -24.0206) <
+      0.001
+  );
+  assert.equal(core.compressorThresholdForMediaVolume(-18, 0), -78);
+});
+
+test("reads only the current 400ms tail from analyser buffers", () => {
+  const samples = new Float32Array([10, -10, 0.25, -0.5, 0.75, -1]);
+  assert.ok(Math.abs(core.meanSquareTail(samples, 4) - 0.46875) < 1e-7);
+  assert.equal(core.maximumAbsoluteTail(samples, 4), 1);
+  assert.equal(core.meanSquareTail(samples, 0), 0);
+  assert.equal(core.maximumAbsoluteTail([], 4), 0);
+});
+
+test("time-based histories expire independently of timer frequency", () => {
+  const samples = [];
+  core.appendTimedSample(samples, 1, 1000, 1000);
+  core.appendTimedSample(samples, 2, 1500, 1000);
+  core.appendTimedSample(samples, 3, 2101, 1000);
+  assert.deepEqual(core.timedSampleValues(samples), [2, 3]);
+  core.appendTimedSample(samples, Number.NaN, 2600, 1000);
+  assert.deepEqual(core.timedSampleValues(samples), [3]);
+});
+
+test("long-term anchors use P95 loudness and P99 sample peaks", () => {
+  const shortTerms = [...Array(95).fill(-20), ...Array(4).fill(-10), 0];
+  const peaks = [...Array(99).fill(0.25), 1];
+  assert.ok(Math.abs(core.percentile(shortTerms, 0.95) - -19.5) < 1e-7);
+  assert.ok(Math.abs(core.percentilePeakDb(peaks, 0.99) - -11.78446) < 1e-4);
+  assert.equal(core.percentile([], 0.95), null);
+  assert.equal(core.percentilePeakDb([], 0.99), Number.NEGATIVE_INFINITY);
+  assert.ok(
+    Math.abs(
+      core.percentilePeakDb([...Array(98).fill(0.25), 1, 1], 0.99)
+    ) < 1e-7
+  );
+});
+
+test("limiter trim cancels its fixed makeup gain below threshold", () => {
+  assert.equal(core.compressorMakeupTrimDb(-1, 20), -0.57);
+  assert.equal(core.compressorMakeupTrimDb(-1, 1), 0);
+  assert.equal(core.compressorMakeupTrimDb(Number.NaN, 20), 0);
+});
+
+test("adaptive loudness uses the complete relative-gated programme", () => {
   const loudnessBlocks = [
     ...Array(5).fill(-55),
     ...Array(96).fill(-22),
@@ -118,9 +287,18 @@ test("adaptive loudness trims rare quiet and loud blocks", () => {
     loudnessBlocks.map(core.energyFromLoudnessDb)
   );
 
-  assert.ok(stats.loudnessDb > -22.2 && stats.loudnessDb < -21.8);
+  assert.ok(stats.loudnessDb > -16.7 && stats.loudnessDb < -16.4);
   assert.ok(stats.medianDb > -22.1 && stats.medianDb < -21.9);
   assert.equal(stats.sampleCount, 100);
+
+  const sparseVoiceStats = core.adaptiveLoudnessStats(
+    [...Array(475).fill(-35), ...Array(5).fill(-10)].map(
+      core.energyFromLoudnessDb
+    )
+  );
+  assert.ok(
+    sparseVoiceStats.loudnessDb > -29 && sparseVoiceStats.loudnessDb < -28
+  );
 });
 
 test("short-term safety only lowers the long-term gain ceiling", () => {
@@ -159,6 +337,14 @@ test("short-term safety only lowers the long-term gain ceiling", () => {
       renderedPeakDb: -1
     }),
     0
+  );
+  assert.equal(
+    core.normalizationSafetyCeilingDb({
+      shortTermLoudnessDb: -3,
+      renderedPeakDb: -1,
+      shortTermCeilingDb: -20
+    }),
+    -17
   );
   assert.ok(Math.abs(core.maximumPeakDb([0, 0.25, 0.5]) + 6.0206) < 0.001);
   assert.equal(core.maximumPeakDb([]), Number.NEGATIVE_INFINITY);

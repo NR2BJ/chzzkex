@@ -12,6 +12,7 @@
   });
 })(typeof globalThis !== "undefined" ? globalThis : this, () => {
   const NORMALIZATION_MAX_BOOST_RANGE = Object.freeze({ min: 0, max: 60 });
+  const NORMALIZATION_TARGET_RANGE = Object.freeze({ min: -60, max: -10 });
   const COMPRESSOR_PRESETS = Object.freeze({
     light: Object.freeze({
       label: "약",
@@ -41,6 +42,7 @@
 
   const DEFAULT_SETTINGS = Object.freeze({
     normalizeVolume: true,
+    normalizationTargetDb: -16,
     normalizationMaxBoostDb: 12,
     compressAudio: true,
     compressorPreset: "medium",
@@ -59,6 +61,7 @@
   return Object.freeze({
     DEFAULT_SETTINGS,
     NORMALIZATION_MAX_BOOST_RANGE,
+    NORMALIZATION_TARGET_RANGE,
     COMPRESSOR_PRESETS
   });
 });

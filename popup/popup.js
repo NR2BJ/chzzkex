@@ -1,6 +1,7 @@
 const {
   DEFAULT_SETTINGS,
-  NORMALIZATION_MAX_BOOST_RANGE
+  NORMALIZATION_MAX_BOOST_RANGE,
+  NORMALIZATION_TARGET_RANGE
 } = globalThis.__CHZZK_EX_CONFIG__;
 
 const fields = Object.keys(DEFAULT_SETTINGS);
@@ -13,6 +14,9 @@ const numberFields = fields.filter(
 const statusElement = document.getElementById("status");
 const normalizationMaxBoostElement = document.getElementById(
   "normalizationMaxBoost"
+);
+const normalizationTargetElement = document.getElementById(
+  "normalizationTarget"
 );
 const compressorPresetElement = document.getElementById("compressorPreset");
 const compressorPresetInputs = Array.from(
@@ -56,23 +60,27 @@ function renderCompressorPresetState(enabled) {
   }
 }
 
-function normalizedMaxBoostDb(value) {
+function normalizedNumberSetting(field, value) {
+  const ranges = {
+    normalizationMaxBoostDb: NORMALIZATION_MAX_BOOST_RANGE,
+    normalizationTargetDb: NORMALIZATION_TARGET_RANGE
+  };
+  const range = ranges[field];
   const number = Number(value);
   return Math.min(
-    NORMALIZATION_MAX_BOOST_RANGE.max,
+    range.max,
     Math.max(
-      NORMALIZATION_MAX_BOOST_RANGE.min,
-      Number.isFinite(number)
-        ? number
-        : DEFAULT_SETTINGS.normalizationMaxBoostDb
+      range.min,
+      Number.isFinite(number) ? number : DEFAULT_SETTINGS[field]
     )
   );
 }
 
-function renderNormalizationMaxBoostState(enabled) {
-  const input = document.getElementById("normalizationMaxBoostDb");
+function renderNormalizationState(enabled) {
   normalizationMaxBoostElement.classList.toggle("is-disabled", !enabled);
-  input.disabled = !enabled;
+  normalizationTargetElement.classList.toggle("is-disabled", !enabled);
+  document.getElementById("normalizationMaxBoostDb").disabled = !enabled;
+  document.getElementById("normalizationTargetDb").disabled = !enabled;
 }
 
 async function loadSettings() {
@@ -82,7 +90,10 @@ async function loadSettings() {
     document.getElementById(field).checked = Boolean(settings[field]);
   }
   for (const field of numberFields) {
-    document.getElementById(field).value = normalizedMaxBoostDb(settings[field]);
+    document.getElementById(field).value = normalizedNumberSetting(
+      field,
+      settings[field]
+    );
   }
   const selectedPreset = compressorPresetInputs.find(
     (input) => input.value === settings.compressorPreset
@@ -90,7 +101,7 @@ async function loadSettings() {
   (selectedPreset || compressorPresetInputs[1]).checked = true;
 
   renderStatus(settings);
-  renderNormalizationMaxBoostState(Boolean(settings.normalizeVolume));
+  renderNormalizationState(Boolean(settings.normalizeVolume));
   renderCompressorPresetState(Boolean(settings.compressAudio));
 }
 
@@ -102,7 +113,7 @@ async function saveSettings() {
   }
   for (const field of numberFields) {
     const input = document.getElementById(field);
-    nextSettings[field] = normalizedMaxBoostDb(input.value);
+    nextSettings[field] = normalizedNumberSetting(field, input.value);
     input.value = nextSettings[field];
   }
   nextSettings.compressorPreset =
@@ -111,7 +122,7 @@ async function saveSettings() {
 
   await storageSet(nextSettings);
   renderStatus(nextSettings);
-  renderNormalizationMaxBoostState(nextSettings.normalizeVolume);
+  renderNormalizationState(nextSettings.normalizeVolume);
   renderCompressorPresetState(nextSettings.compressAudio);
 }
 

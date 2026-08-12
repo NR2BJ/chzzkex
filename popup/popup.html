@@ -19,9 +19,16 @@
       <section>
         <h2>재생</h2>
         <label class="toggle">
-          <span><strong>실시간 음량 맞춤</strong><small>플레이어 볼륨을 유지하고 현재 방송 평균 조정</small></span>
+          <span><strong>실시간 음량 맞춤</strong><small>플레이어 볼륨을 유지하고 방송 간 음량 차이 조정</small></span>
           <input id="normalizeVolume" type="checkbox" role="switch">
         </label>
+        <div id="normalizationTarget" class="number-setting">
+          <strong>목표 음량</strong>
+          <label class="number-field">
+            <input id="normalizationTargetDb" type="number" min="-60" max="-10" step="1" inputmode="numeric">
+            <span>LUFS</span>
+          </label>
+        </div>
         <div id="normalizationMaxBoost" class="number-setting">
           <strong>최대 증폭</strong>
           <label class="number-field">

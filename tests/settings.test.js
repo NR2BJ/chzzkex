@@ -5,6 +5,7 @@ const config = require("../src/settings.js");
 test("keeps one complete immutable settings definition", () => {
   assert.deepEqual(Object.keys(config.DEFAULT_SETTINGS), [
     "normalizeVolume",
+    "normalizationTargetDb",
     "normalizationMaxBoostDb",
     "compressAudio",
     "compressorPreset",
@@ -20,8 +21,11 @@ test("keeps one complete immutable settings definition", () => {
     "debug"
   ]);
   assert.equal(Object.isFrozen(config.DEFAULT_SETTINGS), true);
+  assert.equal(config.DEFAULT_SETTINGS.normalizationTargetDb, -16);
   assert.equal(config.DEFAULT_SETTINGS.normalizationMaxBoostDb, 12);
+  assert.deepEqual(config.NORMALIZATION_TARGET_RANGE, { min: -60, max: -10 });
   assert.deepEqual(config.NORMALIZATION_MAX_BOOST_RANGE, { min: 0, max: 60 });
+  assert.equal(Object.isFrozen(config.NORMALIZATION_TARGET_RANGE), true);
   assert.equal(Object.isFrozen(config.NORMALIZATION_MAX_BOOST_RANGE), true);
   assert.equal(config.DEFAULT_SETTINGS.compressorPreset, "medium");
   assert.deepEqual(Object.keys(config.COMPRESSOR_PRESETS), [
@@ -42,6 +46,7 @@ test("keeps one complete immutable settings definition", () => {
   assert.deepEqual(Object.keys(config), [
     "DEFAULT_SETTINGS",
     "NORMALIZATION_MAX_BOOST_RANGE",
+    "NORMALIZATION_TARGET_RANGE",
     "COMPRESSOR_PRESETS"
   ]);
 });

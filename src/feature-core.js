@@ -147,6 +147,65 @@
     };
   }
 
+  function compressorThresholdForMediaVolume(
+    thresholdDb,
+    volume,
+    minimumVolume = 0.001
+  ) {
+    if (!Number.isFinite(thresholdDb)) {
+      return 0;
+    }
+    const scalar = clamp(
+      Number.isFinite(Number(volume)) ? Number(volume) : 1,
+      Math.max(Number.EPSILON, minimumVolume),
+      1
+    );
+    return thresholdDb + 20 * Math.log10(scalar);
+  }
+
+  function compressorMakeupTrimDb(thresholdDb, ratio) {
+    if (!Number.isFinite(thresholdDb) || !Number.isFinite(ratio) || ratio < 1) {
+      return 0;
+    }
+    const fullScaleOutputDb = Math.min(0, thresholdDb) -
+      Math.min(0, thresholdDb) / ratio;
+    return fullScaleOutputDb * 0.6;
+  }
+
+  function meanSquareTail(samples, sampleCount) {
+    const values = ArrayBuffer.isView(samples) || Array.isArray(samples)
+      ? samples
+      : [];
+    const count = Math.min(
+      values.length,
+      Math.max(0, Math.floor(Number(sampleCount) || 0))
+    );
+    if (!count) {
+      return 0;
+    }
+    let squareSum = 0;
+    for (let index = values.length - count; index < values.length; index += 1) {
+      const sample = Number(values[index]) || 0;
+      squareSum += sample * sample;
+    }
+    return squareSum / count;
+  }
+
+  function maximumAbsoluteTail(samples, sampleCount) {
+    const values = ArrayBuffer.isView(samples) || Array.isArray(samples)
+      ? samples
+      : [];
+    const count = Math.min(
+      values.length,
+      Math.max(0, Math.floor(Number(sampleCount) || 0))
+    );
+    let maximum = 0;
+    for (let index = values.length - count; index < values.length; index += 1) {
+      maximum = Math.max(maximum, Math.abs(Number(values[index]) || 0));
+    }
+    return maximum;
+  }
+
   function gatedLoudnessDb(
     blockEnergies,
     { absoluteGateDb = -70, relativeGateDb = 10 } = {}
@@ -188,13 +247,46 @@
     return lower + (upper - lower) * (position - lowerIndex);
   }
 
+  function percentile(values, ratio) {
+    const sortedValues = (Array.isArray(values) ? values : [])
+      .filter(Number.isFinite)
+      .sort((left, right) => left - right);
+    return quantile(sortedValues, ratio);
+  }
+
+  function appendTimedSample(samples, value, at, maxAgeMs) {
+    if (!Array.isArray(samples)) {
+      return [];
+    }
+    if (Number.isFinite(value) && Number.isFinite(at)) {
+      samples.push({ at, value });
+    }
+    const cutoff = Number(at) - Math.max(0, Number(maxAgeMs) || 0);
+    let removeCount = 0;
+    while (
+      removeCount < samples.length &&
+      (!Number.isFinite(samples[removeCount]?.at) ||
+        samples[removeCount].at < cutoff)
+    ) {
+      removeCount += 1;
+    }
+    if (removeCount) {
+      samples.splice(0, removeCount);
+    }
+    return samples;
+  }
+
+  function timedSampleValues(samples) {
+    return (Array.isArray(samples) ? samples : [])
+      .map((sample) => sample?.value)
+      .filter(Number.isFinite);
+  }
+
   function adaptiveLoudnessStats(
     blockEnergies,
     {
       absoluteGateDb = -70,
-      relativeGateDb = 10,
-      lowerQuantile = 0.1,
-      upperQuantile = 0.9
+      relativeGateDb = 10
     } = {}
   ) {
     const candidates = (Array.isArray(blockEnergies) ? blockEnergies : [])
@@ -223,22 +315,13 @@
     }
 
     const sortedEnergies = [...gated].sort((left, right) => left - right);
-    const lowerEnergy = quantile(sortedEnergies, lowerQuantile);
-    const upperEnergy = quantile(sortedEnergies, upperQuantile);
-    const trimmedEnergies = sortedEnergies.filter(
-      (energy) => energy >= lowerEnergy && energy <= upperEnergy
-    );
-    const representativeEnergies = trimmedEnergies.length
-      ? trimmedEnergies
-      : sortedEnergies;
     const representativeEnergy =
-      representativeEnergies.reduce((sum, energy) => sum + energy, 0) /
-      representativeEnergies.length;
+      gated.reduce((sum, energy) => sum + energy, 0) / gated.length;
     return {
       loudnessDb: loudnessDbFromEnergy(representativeEnergy),
-      lowerDb: loudnessDbFromEnergy(lowerEnergy),
+      lowerDb: loudnessDbFromEnergy(quantile(sortedEnergies, 0.1)),
       medianDb: loudnessDbFromEnergy(quantile(sortedEnergies, 0.5)),
-      upperDb: loudnessDbFromEnergy(upperEnergy),
+      upperDb: loudnessDbFromEnergy(quantile(sortedEnergies, 0.9)),
       sampleCount: gated.length
     };
   }
@@ -246,13 +329,90 @@
   function normalizationGainDb({
     loudnessDb,
     targetDb = -14,
-    minimumDb = -12,
+    minimumDb = -60,
     maximumDb = 12
   }) {
     if (!Number.isFinite(loudnessDb) || !Number.isFinite(targetDb)) {
       return 0;
     }
     return clamp(targetDb - loudnessDb, minimumDb, maximumDb);
+  }
+
+  function normalizationAnchorConfirmed({
+    shortTermLoudnessDb,
+    medianLoudnessDb,
+    peakDb,
+    targetDb = -16,
+    targetMarginDb = 8,
+    activityMarginDb = 6,
+    peakThresholdDb = -12
+  }) {
+    const nearTarget =
+      Number.isFinite(shortTermLoudnessDb) &&
+      shortTermLoudnessDb >= targetDb - Math.max(0, targetMarginDb);
+    const foregroundContrast =
+      Number.isFinite(shortTermLoudnessDb) &&
+      Number.isFinite(medianLoudnessDb) &&
+      shortTermLoudnessDb - medianLoudnessDb >= Math.max(0, activityMarginDb);
+    const strongPeak =
+      Number.isFinite(peakDb) && peakDb >= peakThresholdDb;
+    return nearTarget || foregroundContrast || strongPeak;
+  }
+
+  function hybridNormalizationGainDb({
+    integratedLoudnessDb,
+    shortTermLoudnessDb,
+    peakDb,
+    targetDb = -16,
+    shortTermAllowanceDb = 4,
+    peakCeilingDb = -3,
+    minimumDb = -60,
+    maximumDb = 12,
+    provisionalMaximumDb = 6,
+    anchorConfirmed = true
+  }) {
+    if (
+      !Number.isFinite(integratedLoudnessDb) ||
+      !Number.isFinite(targetDb)
+    ) {
+      return {
+        gainDb: 0,
+        integratedGainDb: 0,
+        shortTermLimitDb: 0,
+        peakLimitDb: 0,
+        effectiveMaximumDb: 0
+      };
+    }
+
+    const boundedMaximumDb = Math.max(minimumDb, maximumDb);
+    const effectiveMaximumDb = anchorConfirmed
+      ? boundedMaximumDb
+      : Math.min(boundedMaximumDb, Math.max(0, provisionalMaximumDb));
+    const integratedGainDb = targetDb - integratedLoudnessDb;
+    const shortTermLimitDb = Number.isFinite(shortTermLoudnessDb)
+      ? targetDb + shortTermAllowanceDb - shortTermLoudnessDb
+      : effectiveMaximumDb;
+    const peakLimitDb = Number.isFinite(peakDb)
+      ? Math.max(0, peakCeilingDb - peakDb)
+      : effectiveMaximumDb;
+    const gainDb = clamp(
+      Math.min(
+        integratedGainDb,
+        shortTermLimitDb,
+        peakLimitDb,
+        effectiveMaximumDb
+      ),
+      minimumDb,
+      boundedMaximumDb
+    );
+
+    return {
+      gainDb,
+      integratedGainDb,
+      shortTermLimitDb,
+      peakLimitDb,
+      effectiveMaximumDb
+    };
   }
 
   function maximumPeakDb(peaks) {
@@ -262,6 +422,13 @@
       0
     );
     return peak > 0 ? 20 * Math.log10(peak) : Number.NEGATIVE_INFINITY;
+  }
+
+  function percentilePeakDb(peaks, ratio = 0.99) {
+    const peak = percentile(peaks, ratio);
+    return Number.isFinite(peak) && peak > 0
+      ? 20 * Math.log10(peak)
+      : Number.NEGATIVE_INFINITY;
   }
 
   function biquadQDbFromLinear(linearQ) {
@@ -275,7 +442,7 @@
     renderedPeakDb,
     shortTermCeilingDb = -11,
     peakCeilingDb = -3,
-    minimumDb = -12,
+    minimumDb = -60,
     maximumDb = 12
   }) {
     const loudnessLimitedGainDb = Number.isFinite(shortTermLoudnessDb)
@@ -379,8 +546,11 @@
 
   return Object.freeze({
     adaptiveLoudnessStats,
+    appendTimedSample,
     biquadQDbFromLinear,
     clamp,
+    compressorMakeupTrimDb,
+    compressorThresholdForMediaVolume,
     colorAlpha,
     energyFromLoudnessDb,
     findContainedChatMessage,
@@ -390,16 +560,23 @@
     formatTimestamp,
     gatedLoudnessDb,
     hasUsableNativeTimeline,
+    hybridNormalizationGainDb,
     isAtLiveEdge,
     loudnessDbFromEnergy,
+    maximumAbsoluteTail,
+    meanSquareTail,
     timelineSeekTarget,
     maximumPeakDb,
+    normalizationAnchorConfirmed,
     normalizationGainDb,
     normalizationSafetyCeilingDb,
+    percentile,
+    percentilePeakDb,
     projectLiveEdge,
     timelineProgress,
     sourceLevelBeforeMediaVolume,
     stepAdaptiveGainDb,
+    timedSampleValues,
     trackLatencyMode
   });
 });

@@ -21,6 +21,7 @@
   const {
     DEFAULT_SETTINGS,
     NORMALIZATION_MAX_BOOST_RANGE,
+    NORMALIZATION_TARGET_RANGE,
     COMPRESSOR_PRESETS
   } = config;
   const EVENT_TOKEN = String.fromCharCode(97, 100);
@@ -36,12 +37,25 @@
   const POWER_READY_TEXT =
     /(?:통나무\s*파워.*(?:배달\s*완료|받기|수령)|(?:배달\s*완료|받기|수령).*통나무\s*파워)/i;
   const POWER_ACTION_TEXT = /^(?:배달\s*완료|받기|수령)$/i;
-  const LOUDNESS_MIN_BLOCKS = 40;
-  const LOUDNESS_ADAPT_INTERVAL_BLOCKS = 20;
-  const LOUDNESS_LONG_MAX_BLOCKS = 480;
-  const LOUDNESS_SHORT_MAX_BLOCKS = 12;
-  const LOUDNESS_SHORT_MIN_ACTIVE_BLOCKS = 4;
-  const LOUDNESS_PEAK_MAX_BLOCKS = 60;
+  const LOUDNESS_TICK_MS = 100;
+  const LOUDNESS_BLOCK_SECONDS = 0.4;
+  const LOUDNESS_INITIAL_BLOCKS = 30;
+  const LOUDNESS_ADAPT_INTERVAL_MS = 5000;
+  const LOUDNESS_LONG_WINDOW_MS = 2 * 60 * 1000;
+  const LOUDNESS_SHORT_WINDOW_MS = 3000;
+  const LOUDNESS_SHORT_MIN_BLOCKS = 27;
+  const LOUDNESS_PEAK_WINDOW_MS = 15 * 1000;
+  const LOUDNESS_ANCHOR_WINDOW_MS = 10 * 60 * 1000;
+  const LOUDNESS_SHORT_TERM_PERCENTILE = 0.95;
+  const LOUDNESS_PEAK_PERCENTILE = 0.99;
+  const LOUDNESS_SHORT_TERM_ALLOWANCE_DB = 4;
+  const LOUDNESS_PEAK_CEILING_DB = -3;
+  const LOUDNESS_PROVISIONAL_MAX_BOOST_DB = 6;
+  const LOUDNESS_GAIN_INCREASE_STEP_DB = 0.05;
+  const LIMITER_THRESHOLD_DB = -1;
+  const LIMITER_RATIO = 20;
+  const LIMITER_ATTACK_SECONDS = 0;
+  const LIMITER_RELEASE_SECONDS = 0.08;
   const K_WEIGHTING_STAGE_ONE_FEEDFORWARD = [
     1.53512485958697,
     -2.69169618940638,
@@ -503,6 +517,8 @@
     graphs: new WeakMap(),
     outputGain: null,
     compressor: null,
+    limiter: null,
+    limiterTrim: null,
     analysers: [],
     sampleBuffers: [],
     peakAnalysers: [],
@@ -510,6 +526,8 @@
     blockEnergies: [],
     recentBlockEnergies: [],
     recentRenderedPeaks: [],
+    shortTermLoudnessHistory: [],
+    sourcePeakHistory: [],
     gainDb: 0,
     longTermGainDb: 0,
     safetyCeilingDb: DEFAULT_SETTINGS.normalizationMaxBoostDb,
@@ -517,7 +535,7 @@
     renderedPeakDb: Number.NEGATIVE_INFINITY,
     adaptiveApplied: false,
     activeBlockCount: 0,
-    nextGainUpdate: LOUDNESS_MIN_BLOCKS,
+    nextGainUpdateAt: 0,
     unlocked: false,
     resumePending: false,
     lastResumeAttemptAt: 0,
@@ -622,6 +640,8 @@
       this.graph = null;
       this.outputGain = null;
       this.compressor = null;
+      this.limiter = null;
+      this.limiterTrim = null;
       this.analysers = [];
       this.sampleBuffers = [];
       this.peakAnalysers = [];
@@ -654,6 +674,17 @@
       );
     },
 
+    currentTargetLoudnessDb() {
+      const value = Number(settings.normalizationTargetDb);
+      return core.clamp(
+        Number.isFinite(value)
+          ? value
+          : DEFAULT_SETTINGS.normalizationTargetDb,
+        NORMALIZATION_TARGET_RANGE.min,
+        NORMALIZATION_TARGET_RANGE.max
+      );
+    },
+
     currentCompressorPreset() {
       return (
         COMPRESSOR_PRESETS[settings.compressorPreset] ||
@@ -668,7 +699,10 @@
       const now = this.context.currentTime;
       const preset = this.currentCompressorPreset();
       const values = {
-        threshold: preset.thresholdDb,
+        threshold: core.compressorThresholdForMediaVolume(
+          preset.thresholdDb,
+          this.video?.volume
+        ),
         knee: preset.kneeDb,
         ratio: enabled ? preset.ratio : 1,
         attack: preset.attackSeconds,
@@ -682,14 +716,43 @@
       }
     },
 
+    configureLimiter(enabled = settings.normalizeVolume) {
+      if (!this.limiter || !this.limiterTrim || !this.context) {
+        return;
+      }
+      const now = this.context.currentTime;
+      const ratio = enabled ? LIMITER_RATIO : 1;
+      const values = {
+        threshold: LIMITER_THRESHOLD_DB,
+        knee: 0,
+        ratio,
+        attack: LIMITER_ATTACK_SECONDS,
+        release: LIMITER_RELEASE_SECONDS
+      };
+      for (const [name, value] of Object.entries(values)) {
+        const parameter = this.limiter[name];
+        parameter.cancelScheduledValues(now);
+        parameter.setValueAtTime(parameter.value, now);
+        parameter.setTargetAtTime(value, now, 0.02);
+      }
+      const trimDb = enabled
+        ? core.compressorMakeupTrimDb(LIMITER_THRESHOLD_DB, ratio)
+        : 0;
+      this.limiterTrim.gain.cancelScheduledValues(now);
+      this.limiterTrim.gain.setValueAtTime(this.limiterTrim.gain.value, now);
+      this.limiterTrim.gain.setTargetAtTime(10 ** (trimDb / 20), now, 0.02);
+    },
+
     resetMeasurement(route = channelIdFromLocation()) {
       this.route = route;
       this.blockEnergies = [];
       this.recentBlockEnergies = [];
       this.recentRenderedPeaks = [];
+      this.shortTermLoudnessHistory = [];
+      this.sourcePeakHistory = [];
       this.adaptiveApplied = false;
       this.activeBlockCount = 0;
-      this.nextGainUpdate = LOUDNESS_MIN_BLOCKS;
+      this.nextGainUpdateAt = 0;
       this.longTermGainDb = 0;
       this.safetyCeilingDb = this.currentMaximumBoostDb();
       this.shortTermLoudnessDb = Number.NEGATIVE_INFINITY;
@@ -706,6 +769,8 @@
       this.blockEnergies = [];
       this.recentBlockEnergies = [];
       this.recentRenderedPeaks = [];
+      this.shortTermLoudnessHistory = [];
+      this.sourcePeakHistory = [];
       this.gainDb = 0;
       this.longTermGainDb = 0;
       this.safetyCeilingDb = this.currentMaximumBoostDb();
@@ -713,7 +778,7 @@
       this.renderedPeakDb = Number.NEGATIVE_INFINITY;
       this.adaptiveApplied = false;
       this.activeBlockCount = 0;
-      this.nextGainUpdate = LOUDNESS_MIN_BLOCKS;
+      this.nextGainUpdateAt = 0;
       this.resumePending = false;
       this.lastResumeAttemptAt = 0;
       this.lastSignalAt = 0;
@@ -726,8 +791,7 @@
       if (graph.connected) {
         return;
       }
-      graph.source.connect(graph.outputGain);
-      graph.source.connect(graph.splitter);
+      graph.source.connect(graph.compressor);
       graph.connected = true;
     },
 
@@ -735,6 +799,8 @@
       const source = this.context.createMediaElementSource(video);
       const outputGain = this.context.createGain();
       const compressor = this.context.createDynamicsCompressor();
+      const limiter = this.context.createDynamicsCompressor();
+      const limiterTrim = this.context.createGain();
       const splitter = this.context.createChannelSplitter(2);
       const silent = this.context.createGain();
       const analysers = [];
@@ -749,7 +815,20 @@
         : 1;
       compressor.attack.value = compressorPreset.attackSeconds;
       compressor.release.value = compressorPreset.releaseSeconds;
-      outputGain.connect(compressor).connect(this.context.destination);
+      limiter.threshold.value = LIMITER_THRESHOLD_DB;
+      limiter.knee.value = 0;
+      limiter.ratio.value = settings.normalizeVolume ? LIMITER_RATIO : 1;
+      limiter.attack.value = LIMITER_ATTACK_SECONDS;
+      limiter.release.value = LIMITER_RELEASE_SECONDS;
+      limiterTrim.gain.value = 10 ** (
+        (settings.normalizeVolume
+          ? core.compressorMakeupTrimDb(LIMITER_THRESHOLD_DB, LIMITER_RATIO)
+          : 0) / 20
+      );
+      compressor.connect(outputGain).connect(limiter).connect(limiterTrim).connect(
+        this.context.destination
+      );
+      compressor.connect(splitter);
       silent.gain.value = 0;
       silent.connect(this.context.destination);
 
@@ -804,6 +883,8 @@
         source,
         outputGain,
         compressor,
+        limiter,
+        limiterTrim,
         splitter,
         analysers,
         peakAnalysers,
@@ -819,6 +900,7 @@
       if (!settings.normalizeVolume && !settings.compressAudio) {
         this.applyGain(0, 0.2);
         this.configureCompressor(false);
+        this.configureLimiter(false);
         return;
       }
 
@@ -837,6 +919,7 @@
       }
       if (video === this.video) {
         this.configureCompressor();
+        this.configureLimiter();
         if (route !== this.route) {
           this.resetMeasurement(route);
         }
@@ -853,7 +936,10 @@
         this.graph = graph;
         this.outputGain = graph.outputGain;
         this.compressor = graph.compressor;
+        this.limiter = graph.limiter;
+        this.limiterTrim = graph.limiterTrim;
         this.configureCompressor();
+        this.configureLimiter();
         this.analysers = graph.analysers;
         this.peakAnalysers = graph.peakAnalysers;
         this.sampleBuffers = graph.analysers.map(
@@ -881,28 +967,95 @@
       }
     },
 
+    pruneMeasurementHistory(now = performance.now()) {
+      const windows = [
+        [this.blockEnergies, LOUDNESS_LONG_WINDOW_MS],
+        [this.recentBlockEnergies, LOUDNESS_SHORT_WINDOW_MS],
+        [this.recentRenderedPeaks, LOUDNESS_PEAK_WINDOW_MS],
+        [this.shortTermLoudnessHistory, LOUDNESS_ANCHOR_WINDOW_MS],
+        [this.sourcePeakHistory, LOUDNESS_ANCHOR_WINDOW_MS]
+      ];
+      for (const [samples, maxAgeMs] of windows) {
+        core.appendTimedSample(samples, Number.NaN, now, maxAgeMs);
+      }
+    },
+
     currentStats() {
-      return core.adaptiveLoudnessStats(this.blockEnergies);
+      this.pruneMeasurementHistory();
+      const stats = core.adaptiveLoudnessStats(
+        core.timedSampleValues(this.blockEnergies)
+      );
+      if (!stats) {
+        return null;
+      }
+      const shortTermAnchorDb = core.percentile(
+        core.timedSampleValues(this.shortTermLoudnessHistory),
+        LOUDNESS_SHORT_TERM_PERCENTILE
+      );
+      const peakAnchorDb = core.percentilePeakDb(
+        core.timedSampleValues(this.sourcePeakHistory),
+        LOUDNESS_PEAK_PERCENTILE
+      );
+      const anchorConfirmed = core.normalizationAnchorConfirmed({
+        shortTermLoudnessDb:
+          shortTermAnchorDb ?? Number.NEGATIVE_INFINITY,
+        medianLoudnessDb: stats.medianDb,
+        peakDb: peakAnchorDb,
+        targetDb: this.currentTargetLoudnessDb()
+      });
+      return {
+        ...stats,
+        shortTermAnchorDb:
+          shortTermAnchorDb ?? Number.NEGATIVE_INFINITY,
+        peakAnchorDb,
+        anchorConfirmed
+      };
+    },
+
+    normalizationPlan(stats) {
+      return core.hybridNormalizationGainDb({
+        integratedLoudnessDb: stats.loudnessDb,
+        shortTermLoudnessDb: stats.shortTermAnchorDb,
+        peakDb: stats.peakAnchorDb,
+        targetDb: this.currentTargetLoudnessDb(),
+        shortTermAllowanceDb: LOUDNESS_SHORT_TERM_ALLOWANCE_DB,
+        peakCeilingDb: LOUDNESS_PEAK_CEILING_DB,
+        maximumDb: this.currentMaximumBoostDb(),
+        provisionalMaximumDb: LOUDNESS_PROVISIONAL_MAX_BOOST_DB,
+        anchorConfirmed: stats.anchorConfirmed
+      });
     },
 
     updateSafetyStats() {
-      const activeShortBlocks = this.recentBlockEnergies.filter(
+      this.pruneMeasurementHistory();
+      const recentBlockEnergies = core.timedSampleValues(
+        this.recentBlockEnergies
+      );
+      const activeShortBlocks = recentBlockEnergies.filter(
         (energy) => core.loudnessDbFromEnergy(energy) >= -70
       );
       this.shortTermLoudnessDb =
-        activeShortBlocks.length >= LOUDNESS_SHORT_MIN_ACTIVE_BLOCKS
-          ? core.gatedLoudnessDb(this.recentBlockEnergies)
+        activeShortBlocks.length >= LOUDNESS_SHORT_MIN_BLOCKS
+          ? core.loudnessDbFromEnergy(
+              recentBlockEnergies.reduce((sum, energy) => sum + energy, 0) /
+                recentBlockEnergies.length
+            )
           : Number.NEGATIVE_INFINITY;
-      this.renderedPeakDb = core.maximumPeakDb(this.recentRenderedPeaks);
+      this.renderedPeakDb = core.maximumPeakDb(
+        core.timedSampleValues(this.recentRenderedPeaks)
+      );
       this.safetyCeilingDb = core.normalizationSafetyCeilingDb({
         shortTermLoudnessDb: this.shortTermLoudnessDb,
         renderedPeakDb: this.renderedPeakDb,
+        shortTermCeilingDb:
+          this.currentTargetLoudnessDb() + LOUDNESS_SHORT_TERM_ALLOWANCE_DB,
+        peakCeilingDb: LOUDNESS_PEAK_CEILING_DB,
         maximumDb: this.currentMaximumBoostDb()
       });
       return this.safetyCeilingDb;
     },
 
-    refreshMaximumBoost() {
+    refreshNormalizationPlan() {
       this.safetyCeilingDb = this.currentMaximumBoostDb();
       if (!settings.normalizeVolume || !this.adaptiveApplied) {
         return;
@@ -912,10 +1065,8 @@
         return;
       }
       this.updateSafetyStats();
-      const requestedGainDb = core.normalizationGainDb({
-        loudnessDb: stats.loudnessDb,
-        maximumDb: this.currentMaximumBoostDb()
-      });
+      const plan = this.normalizationPlan(stats);
+      const requestedGainDb = plan.gainDb;
       this.longTermGainDb = requestedGainDb;
       const targetGainDb = Math.min(requestedGainDb, this.safetyCeilingDb);
       if (Math.abs(targetGainDb - this.gainDb) < 0.05) {
@@ -946,13 +1097,14 @@
     },
 
     applyAdaptiveGain(stats) {
-      const requestedGainDb = core.normalizationGainDb({
-        loudnessDb: stats.loudnessDb,
-        maximumDb: this.currentMaximumBoostDb()
-      });
+      const plan = this.normalizationPlan(stats);
+      const requestedGainDb = plan.gainDb;
       const wasApplied = this.adaptiveApplied;
       this.longTermGainDb = wasApplied
-        ? core.stepAdaptiveGainDb(this.longTermGainDb, requestedGainDb)
+        ? core.stepAdaptiveGainDb(this.longTermGainDb, requestedGainDb, {
+            increaseStepDb: LOUDNESS_GAIN_INCREASE_STEP_DB,
+            decreaseStepDb: 1
+          })
         : requestedGainDb;
       this.adaptiveApplied = true;
 
@@ -974,7 +1126,8 @@
         this.gainDb = nextGainDb;
         this.applyGain(this.gainDb, timeConstant);
       }
-      return { requestedGainDb, targetGainDb };
+      const { gainDb: plannedGainDb, ...limits } = plan;
+      return { ...limits, plannedGainDb, requestedGainDb, targetGainDb };
     },
 
     status() {
@@ -1005,7 +1158,7 @@
       }
       return `측정 ${Math.min(
         99,
-        Math.round((this.activeBlockCount / LOUDNESS_MIN_BLOCKS) * 100)
+        Math.round((this.activeBlockCount / LOUDNESS_INITIAL_BLOCKS) * 100)
       )}%`;
     },
 
@@ -1022,6 +1175,10 @@
 
       let blockEnergy = 0;
       let inputPeak = 0;
+      const measuredAt = performance.now();
+      const blockSampleCount = Math.round(
+        this.context.sampleRate * LOUDNESS_BLOCK_SECONDS
+      );
       const playbackRate = this.video?.playbackRate;
       if (
         settings.debug &&
@@ -1037,17 +1194,14 @@
       for (let channel = 0; channel < this.analysers.length; channel += 1) {
         const samples = this.sampleBuffers[channel];
         this.analysers[channel].getFloatTimeDomainData(samples);
-        let squareSum = 0;
-        for (const sample of samples) {
-          squareSum += sample * sample;
-        }
-        blockEnergy += squareSum / samples.length;
+        blockEnergy += core.meanSquareTail(samples, blockSampleCount);
 
         const peakSamples = this.peakSampleBuffers[channel];
         this.peakAnalysers[channel].getFloatTimeDomainData(peakSamples);
-        for (const sample of peakSamples) {
-          inputPeak = Math.max(inputPeak, Math.abs(sample));
-        }
+        inputPeak = Math.max(
+          inputPeak,
+          core.maximumAbsoluteTail(peakSamples, blockSampleCount)
+        );
       }
 
       const renderedPeak = inputPeak;
@@ -1058,20 +1212,47 @@
         mediaVolume,
         this.video?.muted
       );
-      this.recentBlockEnergies.push(sourceLevel?.energy || 0);
-      this.recentRenderedPeaks.push(renderedPeak);
-      if (this.recentBlockEnergies.length > LOUDNESS_SHORT_MAX_BLOCKS) {
-        this.recentBlockEnergies.shift();
-      }
-      if (this.recentRenderedPeaks.length > LOUDNESS_PEAK_MAX_BLOCKS) {
-        this.recentRenderedPeaks.shift();
-      }
-      this.applySafetyGain();
       if (!sourceLevel) {
         return;
       }
       blockEnergy = sourceLevel.energy;
       inputPeak = sourceLevel.peak;
+
+      core.appendTimedSample(
+        this.recentBlockEnergies,
+        blockEnergy,
+        measuredAt,
+        LOUDNESS_SHORT_WINDOW_MS
+      );
+      core.appendTimedSample(
+        this.recentRenderedPeaks,
+        renderedPeak,
+        measuredAt,
+        LOUDNESS_PEAK_WINDOW_MS
+      );
+      this.applySafetyGain();
+
+      if (Number.isFinite(this.shortTermLoudnessDb)) {
+        core.appendTimedSample(
+          this.shortTermLoudnessHistory,
+          this.shortTermLoudnessDb,
+          measuredAt,
+          LOUDNESS_ANCHOR_WINDOW_MS
+        );
+      } else {
+        core.appendTimedSample(
+          this.shortTermLoudnessHistory,
+          Number.NaN,
+          measuredAt,
+          LOUDNESS_ANCHOR_WINDOW_MS
+        );
+      }
+      core.appendTimedSample(
+        this.sourcePeakHistory,
+        inputPeak,
+        measuredAt,
+        LOUDNESS_ANCHOR_WINDOW_MS
+      );
 
       const projectedPeak = renderedPeak * 10 ** (this.gainDb / 20);
       if (
@@ -1090,16 +1271,27 @@
       }
 
       if (core.loudnessDbFromEnergy(blockEnergy) < -70) {
+        core.appendTimedSample(
+          this.blockEnergies,
+          Number.NaN,
+          measuredAt,
+          LOUDNESS_LONG_WINDOW_MS
+        );
         return;
       }
       this.lastSignalAt = performance.now();
       this.activeBlockCount += 1;
-      this.blockEnergies.push(blockEnergy);
-      if (this.blockEnergies.length > LOUDNESS_LONG_MAX_BLOCKS) {
-        this.blockEnergies.shift();
-      }
+      core.appendTimedSample(
+        this.blockEnergies,
+        blockEnergy,
+        measuredAt,
+        LOUDNESS_LONG_WINDOW_MS
+      );
 
-      if (this.activeBlockCount >= this.nextGainUpdate) {
+      if (
+        this.activeBlockCount >= LOUDNESS_INITIAL_BLOCKS &&
+        measuredAt >= this.nextGainUpdateAt
+      ) {
         const stats = this.currentStats();
         if (stats && Number.isFinite(stats.loudnessDb)) {
           const gains = this.applyAdaptiveGain(stats);
@@ -1112,14 +1304,14 @@
             playbackRate: this.video?.playbackRate
           });
         }
-        this.nextGainUpdate += LOUDNESS_ADAPT_INTERVAL_BLOCKS;
+        this.nextGainUpdateAt = measuredAt + LOUDNESS_ADAPT_INTERVAL_MS;
       }
     },
 
     start() {
       document.addEventListener("pointerdown", this.unlock, { capture: true });
       document.addEventListener("keydown", this.unlock, { capture: true });
-      setInterval(() => this.tick(), 250);
+      setInterval(() => this.tick(), LOUDNESS_TICK_MS);
     }
   };
 
@@ -1953,9 +2145,13 @@
 
   function applySettings(nextSettings) {
     const previousMaximumBoostDb = loudness.currentMaximumBoostDb();
+    const previousTargetLoudnessDb = loudness.currentTargetLoudnessDb();
+    const previousCompressAudio = settings.compressAudio;
+    const previousCompressorPreset = settings.compressorPreset;
     settings = { ...settings, ...nextSettings };
     if (!settings.normalizeVolume) {
       loudness.disableNormalization();
+      loudness.configureLimiter(false);
     }
     if (!settings.compressAudio) {
       loudness.configureCompressor(false);
@@ -1963,8 +2159,18 @@
     if (settings.normalizeVolume || settings.compressAudio) {
       loudness.ensureGraph();
     }
-    if (previousMaximumBoostDb !== loudness.currentMaximumBoostDb()) {
-      loudness.refreshMaximumBoost();
+    if (
+      settings.normalizeVolume &&
+      (previousCompressAudio !== settings.compressAudio ||
+        previousCompressorPreset !== settings.compressorPreset)
+    ) {
+      loudness.resetMeasurement();
+    }
+    if (
+      previousMaximumBoostDb !== loudness.currentMaximumBoostDb() ||
+      previousTargetLoudnessDb !== loudness.currentTargetLoudnessDb()
+    ) {
+      loudness.refreshNormalizationPlan();
     }
     if (!settings.sidebarPreview) {
       sidebarPreview.hide();

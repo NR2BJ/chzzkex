@@ -180,7 +180,7 @@ input[role="switch"]:focus-visible {
 
 .number-field {
   display: grid;
-  grid-template-columns: 64px 24px;
+  grid-template-columns: 64px 42px;
   align-items: center;
   gap: 6px;
   color: #52605b;
