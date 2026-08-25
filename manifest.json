@@ -3,7 +3,7 @@
   "name": "CHZZK EX",
   "short_name": "CHZZK EX",
   "description": "Playback, navigation, and chat conveniences for CHZZK.",
-  "version": "1.0.7",
+  "version": "1.0.8",
   "permissions": [
     "declarativeNetRequest",
     "storage"

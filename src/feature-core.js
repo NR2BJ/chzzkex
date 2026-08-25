@@ -153,6 +153,13 @@
     return Boolean(next && next !== previous);
   }
 
+  function isSidebarPreviewTarget(href, insideSidebar) {
+    return Boolean(
+      insideSidebar &&
+      /^\/live\/[a-f0-9]{32}(?:[/?#]|$)/i.test(String(href || ""))
+    );
+  }
+
   function compressorThresholdForMediaVolume(
     thresholdDb,
     volume,
@@ -568,6 +575,7 @@
     hasUsableNativeTimeline,
     hybridNormalizationGainDb,
     isAtLiveEdge,
+    isSidebarPreviewTarget,
     loudnessDbFromEnergy,
     maximumAbsoluteTail,
     meanSquareTail,

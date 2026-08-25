@@ -22,6 +22,14 @@ test("keeps loudness measurements while live playback continues on home", () => 
   assert.equal(core.shouldResetLoudnessMeasurement("", "channel-a"), true);
 });
 
+test("limits hover previews to live links inside the actual sidebar", () => {
+  const liveHref = "/live/0123456789abcdef0123456789abcdef";
+  assert.equal(core.isSidebarPreviewTarget(liveHref, true), true);
+  assert.equal(core.isSidebarPreviewTarget(`${liveHref}?from=following`, true), true);
+  assert.equal(core.isSidebarPreviewTarget(liveHref, false), false);
+  assert.equal(core.isSidebarPreviewTarget("/live/not-a-channel", true), false);
+});
+
 test("formats relative timeline offsets", () => {
   assert.equal(core.formatOffset(0), "-00:00");
   assert.equal(core.formatOffset(89.5), "-01:30");

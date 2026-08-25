@@ -1448,14 +1448,27 @@
     cache: new Map(),
     suppressedTitles: [],
     fallbackTitle: "",
+    route: "",
+    observer: null,
 
     liveLink(target) {
       const link = target?.closest?.("a[href^='/live/']");
-      if (!link?.getAttribute("href")?.match(/^\/live\/([a-f0-9]{32})/i)) {
-        return null;
-      }
-      const semanticSidebar = link.closest("aside, nav, [class*='sidebar']");
-      return semanticSidebar || link.getBoundingClientRect().left < 360 ? link : null;
+      return core.isSidebarPreviewTarget(
+        link?.getAttribute("href"),
+        Boolean(link?.closest("#sidebar"))
+      )
+        ? link
+        : null;
+    },
+
+    isCurrent(link) {
+      return Boolean(
+        settings.sidebarPreview &&
+        this.currentLink === link &&
+        this.route === location.href &&
+        link?.isConnected &&
+        this.liveLink(link) === link
+      );
     },
 
     linkTitle(link) {
@@ -1566,7 +1579,10 @@
     },
 
     async show(link) {
-      if (!settings.sidebarPreview || this.currentLink !== link) {
+      if (!this.isCurrent(link)) {
+        if (this.currentLink === link) {
+          this.hide();
+        }
         return;
       }
 
@@ -1586,11 +1602,14 @@
       const detail = await this.fetchDetail(channelId);
       if (!detail) {
         if (this.currentLink === link) {
-          card.classList.remove("is-loading", "is-visible");
+          this.hide();
         }
         return;
       }
-      if (this.currentLink !== link) {
+      if (!this.isCurrent(link)) {
+        if (this.currentLink === link) {
+          this.hide();
+        }
         return;
       }
 
@@ -1611,11 +1630,23 @@
 
     hide() {
       clearTimeout(this.timer);
+      clearTimeout(this.hideTimer);
       this.controller?.abort();
+      this.timer = null;
+      this.hideTimer = null;
+      this.controller = null;
       this.currentLink = null;
       this.fallbackTitle = "";
+      this.route = "";
       this.restoreNativeTooltip();
-      this.card?.classList.remove("is-visible");
+      this.card?.classList.remove("is-loading", "is-visible");
+    },
+
+    checkPageState() {
+      const link = this.currentLink;
+      if (link && !this.isCurrent(link)) {
+        this.hide();
+      }
     },
 
     onPointerOver(event) {
@@ -1633,6 +1664,7 @@
       clearTimeout(sidebarPreview.timer);
       clearTimeout(sidebarPreview.hideTimer);
       sidebarPreview.currentLink = link;
+      sidebarPreview.route = location.href;
       sidebarPreview.suppressNativeTooltip(link);
       sidebarPreview.timer = setTimeout(() => sidebarPreview.show(link), 250);
     },
@@ -1666,11 +1698,34 @@
       }
     },
 
+    onNavigationIntent() {
+      sidebarPreview.hide();
+    },
+
+    onPageStateChange() {
+      sidebarPreview.checkPageState();
+    },
+
+    onVisibilityChange() {
+      if (document.visibilityState !== "visible") {
+        sidebarPreview.hide();
+      }
+    },
+
     start() {
       document.addEventListener("pointerover", this.onPointerOver, true);
       document.addEventListener("pointerout", this.onPointerOut, true);
       document.addEventListener("mouseover", this.stopNativeMouseTooltip, true);
       document.addEventListener("mouseout", this.stopNativeMouseTooltip, true);
+      document.addEventListener("click", this.onNavigationIntent, true);
+      document.addEventListener("visibilitychange", this.onVisibilityChange);
+      window.addEventListener("popstate", this.onPageStateChange);
+      window.addEventListener("hashchange", this.onPageStateChange);
+      window.addEventListener("pagehide", this.onNavigationIntent);
+      window.addEventListener("resize", this.onNavigationIntent);
+      window.addEventListener("scroll", this.onNavigationIntent, true);
+      this.observer = new MutationObserver(this.onPageStateChange);
+      this.observer.observe(document, { childList: true, subtree: true });
     }
   };
 
