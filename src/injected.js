@@ -43,10 +43,6 @@
     `${KOREAN_EVENT_LABEL}|\\b${EVENT_TOKEN}\\b`,
     "i"
   );
-  const EVENT_NOTICE_TITLE_SELECTOR = [
-    `[class^='${EVENT_TOKEN}_block_title']`,
-    `[class*='${EVENT_TOKEN}_block_title']`
-  ].join(", ");
   const AUXILIARY_CONTAINER_CLASS = "chzzk-ex-auxiliary";
   const AUXILIARY_MEDIA_HOST_PATTERN = /(^|\.)((tvetamovie\.pstatic\.net)|(glad-vod\.pstatic\.net)|(video-gfa\.pstatic\.net))$/i;
 
@@ -134,11 +130,50 @@
   function rewriteJsonText(text, requestKind) {
     try {
       const payload = JSON.parse(text);
-      return JSON.stringify(core.rewritePayload(requestKind, payload));
+      const originalJson = JSON.stringify(payload);
+      const rewrittenJson = JSON.stringify(
+        core.rewritePayload(requestKind, payload)
+      );
+      return rewrittenJson === originalJson ? null : rewrittenJson;
     } catch (error) {
       log("json rewrite skipped", requestKind, error);
-      return text;
+      return null;
     }
+  }
+
+  const textDecoderPrototype = globalThis.TextDecoder?.prototype;
+  const nativeTextDecoderDecode = textDecoderPrototype?.decode;
+
+  function isProtectedTunnelDecoder(decoder) {
+    return (
+      decoder?.encoding === "utf-8" &&
+      decoder.fatal === true &&
+      decoder.ignoreBOM === false
+    );
+  }
+
+  if (typeof nativeTextDecoderDecode === "function") {
+    textDecoderPrototype.decode = function patchedTextDecoderDecode() {
+      const decodedText = nativeTextDecoderDecode.apply(this, arguments);
+      if (
+        !isProtectedTunnelDecoder(this) ||
+        typeof decodedText !== "string" ||
+        !/^\s*\{/.test(decodedText)
+      ) {
+        return decodedText;
+      }
+
+      const rewrittenText = rewriteJsonText(
+        decodedText,
+        core.REQUEST_KIND.TUNNELED_API
+      );
+      if (rewrittenText === null) {
+        return decodedText;
+      }
+
+      log("rewrote protected response");
+      return rewrittenText;
+    };
   }
 
   async function rewriteResponse(response, requestKind) {
@@ -147,7 +182,12 @@
       return response;
     }
 
-    return new Response(rewriteJsonText(text, requestKind), {
+    const rewrittenText = rewriteJsonText(text, requestKind);
+    if (rewrittenText === null) {
+      return response;
+    }
+
+    return new Response(rewrittenText, {
       status: response.status,
       statusText: response.statusText,
       headers: jsonHeaders(response.headers)
@@ -175,7 +215,6 @@
 
   const xhrPrototype = XMLHttpRequest.prototype;
   const nativeOpen = xhrPrototype.open;
-  const nativeSend = xhrPrototype.send;
   const nativeResponseTextGetter = Object.getOwnPropertyDescriptor(
     xhrPrototype,
     "responseText"
@@ -184,7 +223,9 @@
     xhrPrototype,
     "response"
   )?.get;
+  const xhrRequestKinds = new WeakMap();
   const xhrRewriteCache = new WeakMap();
+  const xhrFacades = new WeakSet();
 
   function xhrCacheKey(xhr, requestKind) {
     return [requestKind, xhr.responseType || "text"].join(":");
@@ -206,9 +247,12 @@
       return cached.rewritten;
     }
 
-    const rewritten = rewriteJsonText(originalText, requestKind);
+    const rewrittenText = rewriteJsonText(originalText, requestKind);
+    const rewritten = rewrittenText === null ? originalText : rewrittenText;
     xhrRewriteCache.set(xhr, { key, original: originalText, rewritten });
-    log("rewrote XHR response", requestKind);
+    if (rewrittenText !== null) {
+      log("rewrote XHR response", requestKind);
+    }
     return rewritten;
   }
 
@@ -236,25 +280,35 @@
       return originalJson;
     }
 
+    const originalSerialized = JSON.stringify(clonedJson);
     const rewritten = core.rewritePayload(requestKind, clonedJson);
+    if (JSON.stringify(rewritten) === originalSerialized) {
+      xhrRewriteCache.set(xhr, {
+        key,
+        original: originalJson,
+        rewritten: originalJson
+      });
+      return originalJson;
+    }
+
     xhrRewriteCache.set(xhr, { key, original: originalJson, rewritten });
     log("rewrote XHR JSON response", requestKind);
     return rewritten;
   }
 
   function installXhrFacade(xhr) {
-    if (xhr.__chzzkExFacadeInstalled) {
+    if (xhrFacades.has(xhr)) {
       return;
     }
 
-    xhr.__chzzkExFacadeInstalled = true;
+    xhrFacades.add(xhr);
 
     if (nativeResponseTextGetter) {
       Object.defineProperty(xhr, "responseText", {
         configurable: true,
         get() {
           const originalText = nativeResponseTextGetter.call(this);
-          const requestKind = this.__chzzkExRequestKind;
+          const requestKind = xhrRequestKinds.get(this);
           return rewrittenXhrText(this, requestKind, originalText);
         }
       });
@@ -265,7 +319,7 @@
         configurable: true,
         get() {
           const originalResponse = nativeResponseGetter.call(this);
-          const requestKind = this.__chzzkExRequestKind;
+          const requestKind = xhrRequestKinds.get(this);
 
           if (this.responseType === "json") {
             return rewrittenXhrJson(this, requestKind, originalResponse);
@@ -281,16 +335,41 @@
     }
   }
 
+  function shouldInstallXhrFacade(requestKind) {
+    return (
+      core.shouldRewrite(requestKind) &&
+      requestKind !== core.REQUEST_KIND.TUNNELED_API
+    );
+  }
+
+  function uninstallXhrFacade(xhr) {
+    if (!xhrFacades.has(xhr)) {
+      return;
+    }
+
+    if (nativeResponseTextGetter) {
+      delete xhr.responseText;
+    }
+    if (nativeResponseGetter) {
+      delete xhr.response;
+    }
+    xhrFacades.delete(xhr);
+  }
+
   xhrPrototype.open = function patchedOpen(method, url) {
     const result = nativeOpen.apply(this, arguments);
-    this.__chzzkExRequestKind = core.classifyRequest(requestUrl(url));
+    const requestKind = core.classifyRequest(requestUrl(url));
+    xhrRequestKinds.set(this, requestKind);
     xhrRewriteCache.delete(this);
-    installXhrFacade(this);
+    if (shouldInstallXhrFacade(requestKind)) {
+      installXhrFacade(this);
+    } else {
+      uninstallXhrFacade(this);
+    }
+    if (core.shouldRewrite(requestKind)) {
+      log("observed XHR route", requestKind);
+    }
     return result;
-  };
-
-  xhrPrototype.send = function patchedSend(body) {
-    return nativeSend.apply(this, arguments);
   };
 
   function clickElement(element) {
@@ -385,15 +464,6 @@
 
     finishAuxiliaryVideos();
 
-    const playbackNoticeTitle = document.querySelector(EVENT_NOTICE_TITLE_SELECTOR);
-    if (playbackNoticeTitle) {
-      const closeButton = document.querySelector(
-        "[class^='popup_cell'] button, [class*='popup_cell'] button"
-      );
-      if (clickElement(closeButton)) {
-        log("closed playback notice");
-      }
-    }
   }
 
   function startDomWatchers() {

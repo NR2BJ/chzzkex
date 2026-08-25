@@ -16,6 +16,14 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const distDir = path.join(rootDir, "dist");
 const stageDir = path.join(distDir, ".stage");
 const runtimeEntries = ["NOTICE.md", "popup", "rules", "src"];
+const contentBundleSources = ["src/settings.js", "src/content.js"];
+const mainBundleSources = [
+  "src/settings.js",
+  "src/rewrite-core.js",
+  "src/injected.js",
+  "src/feature-core.js",
+  "src/features.js"
+];
 const manifest = JSON.parse(
   await readFile(path.join(rootDir, "manifest.json"), "utf8")
 );
@@ -45,7 +53,30 @@ async function stageRuntime(browser) {
     }
   }
 
+  const bundle = async (fileName, sources) => {
+    const contents = await Promise.all(
+      sources.map((source) => readFile(path.join(rootDir, source), "utf8"))
+    );
+    await writeFile(
+      path.join(browserDir, "src", fileName),
+      `${contents.join("\n")}\n`,
+      "utf8"
+    );
+  };
+
+  await Promise.all([
+    bundle("content-bundle.js", contentBundleSources),
+    bundle("main-bundle.js", mainBundleSources)
+  ]);
+
   const browserManifest = JSON.parse(JSON.stringify(manifest));
+  for (const contentScript of browserManifest.content_scripts || []) {
+    if (contentScript.world === "MAIN") {
+      contentScript.js = ["src/main-bundle.js"];
+    } else if (contentScript.js?.includes("src/content.js")) {
+      contentScript.js = ["src/content-bundle.js"];
+    }
+  }
   if (browser === "chrome") {
     delete browserManifest.browser_specific_settings;
   }
