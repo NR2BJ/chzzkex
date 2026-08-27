@@ -66,6 +66,14 @@ test("maps the custom bar to seconds behind the projected live edge", () => {
   assert.equal(core.timelineSeekTarget(10, 10, 10, 90, 0.5), null);
 });
 
+test("seeks a newly started live video close to the current seekable edge", () => {
+  assert.equal(core.initialLiveSeekTarget(97, 10, 100), 99.75);
+  assert.equal(core.initialLiveSeekTarget(99.2, 10, 100), null);
+  assert.equal(core.initialLiveSeekTarget(80, 90, 100), 99.75);
+  assert.equal(core.initialLiveSeekTarget(100, 10, 100), null);
+  assert.equal(core.initialLiveSeekTarget(10, 10, 10), null);
+});
+
 test("recognizes only a genuinely visible native timeline", () => {
   assert.equal(
     core.hasUsableNativeTimeline([

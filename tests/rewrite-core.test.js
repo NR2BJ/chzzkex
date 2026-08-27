@@ -125,6 +125,9 @@ test("clears the current playback event response", () => {
 });
 
 test("normalizes playback bootstrap without changing quality tracks", () => {
+  const direct1080 =
+    "https://nvelop-livecloud.pstatic.net/channel/1080p/playlist.m3u8?token=test";
+  const encoded1080 = Buffer.from(direct1080).toString("base64url");
   const playback = {
     meta: { [CONNECTION_TOKEN]: true },
     api: [
@@ -140,7 +143,7 @@ test("normalizes playback bootstrap without changing quality tracks", () => {
         encodingTrack: [
           {
             encodingTrackId: "1080p",
-            [CONNECTION_FIELDS.path]: `${CONNECTION_TOKEN}-1080`
+            [CONNECTION_FIELDS.path]: `/channel/1080p?cdn_url=${encoded1080}`
           },
           {
             encodingTrackId: "480p",
@@ -172,6 +175,7 @@ test("normalizes playback bootstrap without changing quality tracks", () => {
   );
   assert.equal(rewrittenPlayback.meta[CONNECTION_TOKEN], false);
   assert.equal(rewrittenPlayback.api.length, 1);
+  assert.equal(rewrittenPlayback.media[0].encodingTrack[0].path, direct1080);
   assert.equal(
     CONNECTION_FIELDS.path in rewrittenPlayback.media[0].encodingTrack[0],
     false
@@ -179,6 +183,50 @@ test("normalizes playback bootstrap without changing quality tracks", () => {
   assert.equal(
     CONNECTION_FIELDS.encodedPath in rewrittenPlayback.media[0].encodingTrack[1],
     false
+  );
+});
+
+test("normalizes a parsed live payload even when its request route was missed", () => {
+  const payload = {
+    code: 200,
+    content: {
+      channel: { channelId: "channel-id" },
+      [FIELDS.state]: true,
+      [FIELDS.bootstrap]: false,
+      livePlaybackJson: null
+    }
+  };
+
+  const rewritten = core.sanitizeParsedPayload(payload);
+
+  assert.equal(rewritten.content[FIELDS.state], false);
+  assert.equal(rewritten.content[FIELDS.bootstrap], true);
+});
+
+test("rejects an untrusted direct playback host", () => {
+  const encoded = Buffer.from(
+    "https://pstatic.net.example.test/channel/1080p/playlist.m3u8"
+  ).toString("base64url");
+  const playback = {
+    media: [
+      {
+        mediaId: "LLHLS",
+        encodingTrack: [
+          {
+            encodingTrackId: "1080p",
+            [CONNECTION_FIELDS.path]: `/channel/1080p?cdn_url=${encoded}`
+          }
+        ]
+      }
+    ]
+  };
+
+  core.sanitizeParsedPlayback(playback);
+
+  assert.equal("path" in playback.media[0].encodingTrack[0], false);
+  assert.equal(
+    playback.media[0].encodingTrack[0][CONNECTION_FIELDS.path],
+    `/channel/1080p?cdn_url=${encoded}`
   );
 });
 

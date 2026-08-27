@@ -17,10 +17,23 @@
     configurable: false
   });
 
+  const nativeJsonParse = JSON.parse;
   const MESSAGE_SOURCE = "chzzk-ex";
   const { DEFAULT_SETTINGS } = config;
   const EVENT_TOKEN = String.fromCharCode(97, 100);
   const EVENT_TITLE_TOKEN = `${EVENT_TOKEN[0].toUpperCase()}${EVENT_TOKEN.slice(1)}`;
+  const PLAYBACK_REJECTION_EVENT = [
+    EVENT_TOKEN.toUpperCase(),
+    "NOT",
+    "DISPLAYED"
+  ].join("_");
+  const PLAYBACK_ADVANCE_EVENT = ["ui", EVENT_TOKEN, "skip"].join("_");
+  const PLAYBACK_ADVANCE_DELAY_MS = 150;
+  const PRIMARY_MUTE_RESTORE_DELAY_MS = 500;
+  const PRIMARY_UNMUTED_SNAPSHOT_DELAY_MS = 750;
+  const USER_VOLUME_INTENT_WINDOW_MS = 1200;
+  const FILTER_PLAYBACK_RUNTIME = Symbol.for("chzzkfilter-playback");
+  const ownsPlaybackTransport = !window[FILTER_PLAYBACK_RUNTIME];
   const KOREAN_EVENT_LABEL = String.fromCharCode(44305, 44256);
   const KOREAN_SKIP_LABEL = String.fromCharCode(49828, 53429);
   const AUXILIARY_VIDEO_CONTAINER_SELECTOR = [
@@ -47,6 +60,78 @@
   const AUXILIARY_MEDIA_HOST_PATTERN = /(^|\.)((tvetamovie\.pstatic\.net)|(glad-vod\.pstatic\.net)|(video-gfa\.pstatic\.net))$/i;
 
   let settings = { ...DEFAULT_SETTINGS };
+  let playbackAdvanceListeners;
+  let pendingPrimaryMuted;
+  let preferredPrimaryMuted;
+  let lastUserVolumeIntentAt = Number.NEGATIVE_INFINITY;
+  const advancedAuxiliaryVideos = new WeakSet();
+  const pendingAuxiliaryVideos = new WeakSet();
+  const pendingPrimarySnapshots = new WeakSet();
+
+  function suppressPlaybackRejectionSignal() {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        Object.prototype,
+        PLAYBACK_REJECTION_EVENT
+      )
+    ) {
+      return;
+    }
+
+    Object.defineProperty(Object.prototype, PLAYBACK_REJECTION_EVENT, {
+      configurable: true,
+      get() {
+        return undefined;
+      },
+      set(value) {
+        if (value !== PLAYBACK_REJECTION_EVENT) {
+          return;
+        }
+
+        Object.defineProperty(this, PLAYBACK_REJECTION_EVENT, {
+          value,
+          configurable: true,
+          enumerable: true,
+          writable: true
+        });
+      }
+    });
+  }
+
+  function capturePlaybackAdvanceSignal() {
+    if (
+      Object.prototype.hasOwnProperty.call(
+        Object.prototype,
+        PLAYBACK_ADVANCE_EVENT
+      )
+    ) {
+      return;
+    }
+
+    Object.defineProperty(Object.prototype, PLAYBACK_ADVANCE_EVENT, {
+      configurable: true,
+      get() {
+        return undefined;
+      },
+      set(value) {
+        if (Array.isArray(value)) {
+          playbackAdvanceListeners = value;
+        }
+
+        Object.defineProperty(this, PLAYBACK_ADVANCE_EVENT, {
+          value,
+          configurable: true,
+          enumerable: true,
+          writable: true
+        });
+      }
+    });
+  }
+
+  suppressPlaybackRejectionSignal();
+  if (ownsPlaybackTransport) {
+    capturePlaybackAdvanceSignal();
+  }
 
   function log(...args) {
     if (settings.debug) {
@@ -129,7 +214,7 @@
 
   function rewriteJsonText(text, requestKind) {
     try {
-      const payload = JSON.parse(text);
+      const payload = nativeJsonParse(text);
       const originalJson = JSON.stringify(payload);
       const rewrittenJson = JSON.stringify(
         core.rewritePayload(requestKind, payload)
@@ -143,6 +228,20 @@
 
   const textDecoderPrototype = globalThis.TextDecoder?.prototype;
   const nativeTextDecoderDecode = textDecoderPrototype?.decode;
+
+  if (typeof nativeJsonParse === "function") {
+    Object.defineProperty(JSON, "parse", {
+      value: new Proxy(nativeJsonParse, {
+        apply(target, thisArg, args) {
+          return core.sanitizeParsedPayload(
+            Reflect.apply(target, thisArg, args)
+          );
+        }
+      }),
+      configurable: true,
+      writable: true
+    });
+  }
 
   function isProtectedTunnelDecoder(decoder) {
     return (
@@ -195,23 +294,25 @@
   }
 
   const nativeFetch = window.fetch;
-  window.fetch = async function patchedFetch(input) {
-    const url = requestUrl(input);
-    const requestKind = core.classifyRequest(url);
+  if (typeof nativeFetch === "function") {
+    window.fetch = async function patchedFetch(input) {
+      const url = requestUrl(input);
+      const requestKind = core.classifyRequest(url);
 
-    if (core.shouldShortCircuit(requestKind)) {
-      log("handled playback decision request", requestKind);
-      return jsonResponse(core.syntheticPayload(requestKind));
-    }
+      if (core.shouldShortCircuit(requestKind)) {
+        log("handled playback decision request", requestKind);
+        return jsonResponse(core.syntheticPayload(requestKind));
+      }
 
-    const response = await nativeFetch.apply(this, arguments);
-    if (!core.shouldRewrite(requestKind)) {
-      return response;
-    }
+      const response = await nativeFetch.apply(this, arguments);
+      if (!core.shouldRewrite(requestKind)) {
+        return response;
+      }
 
-    log("rewriting response", requestKind);
-    return rewriteResponse(response, requestKind);
-  };
+      log("rewriting response", requestKind);
+      return rewriteResponse(response, requestKind);
+    };
+  }
 
   const xhrPrototype = XMLHttpRequest.prototype;
   const nativeOpen = xhrPrototype.open;
@@ -274,7 +375,7 @@
 
     let clonedJson;
     try {
-      clonedJson = JSON.parse(JSON.stringify(originalJson));
+      clonedJson = nativeJsonParse(JSON.stringify(originalJson));
     } catch (error) {
       log("XHR JSON clone skipped", requestKind, error);
       return originalJson;
@@ -356,21 +457,23 @@
     xhrFacades.delete(xhr);
   }
 
-  xhrPrototype.open = function patchedOpen(method, url) {
-    const result = nativeOpen.apply(this, arguments);
-    const requestKind = core.classifyRequest(requestUrl(url));
-    xhrRequestKinds.set(this, requestKind);
-    xhrRewriteCache.delete(this);
-    if (shouldInstallXhrFacade(requestKind)) {
-      installXhrFacade(this);
-    } else {
-      uninstallXhrFacade(this);
-    }
-    if (core.shouldRewrite(requestKind)) {
-      log("observed XHR route", requestKind);
-    }
-    return result;
-  };
+  if (typeof nativeOpen === "function") {
+    xhrPrototype.open = function patchedOpen(method, url) {
+      const result = nativeOpen.apply(this, arguments);
+      const requestKind = core.classifyRequest(requestUrl(url));
+      xhrRequestKinds.set(this, requestKind);
+      xhrRewriteCache.delete(this);
+      if (shouldInstallXhrFacade(requestKind)) {
+        installXhrFacade(this);
+      } else {
+        uninstallXhrFacade(this);
+      }
+      if (core.shouldRewrite(requestKind)) {
+        log("observed XHR route", requestKind);
+      }
+      return result;
+    };
+  }
 
   function clickElement(element) {
     if (!element || element.disabled) {
@@ -420,12 +523,182 @@
     );
   }
 
+  function hasActiveAuxiliaryPlayback() {
+    return Array.from(document.querySelectorAll("video")).some(
+      (video) =>
+        isAuxiliaryVideo(video) &&
+        Boolean(video.currentSrc || video.src) &&
+        (!video.paused || video.readyState > 0)
+    );
+  }
+
+  function volumeControlText(node) {
+    if (!node || typeof node !== "object") {
+      return "";
+    }
+
+    const className =
+      typeof node.className === "string"
+        ? node.className
+        : node.className?.baseVal || "";
+    return [
+      node.localName,
+      node.id,
+      className,
+      node.getAttribute?.("aria-label"),
+      node.getAttribute?.("title")
+    ]
+      .filter(Boolean)
+      .join(" ");
+  }
+
+  function isVolumeControlIntent(event) {
+    if (event.type === "keydown") {
+      return String(event.key || "").toLowerCase() === "m";
+    }
+
+    const path =
+      typeof event.composedPath === "function"
+        ? event.composedPath()
+        : [event.target];
+    return path.some((node) =>
+      /volume|mute|볼륨|음량|음소거/i.test(volumeControlText(node))
+    );
+  }
+
+  function noteUserVolumeIntent(event) {
+    if (isVolumeControlIntent(event)) {
+      lastUserVolumeIntentAt = Date.now();
+    }
+  }
+
+  function hasRecentUserVolumeIntent() {
+    return Date.now() - lastUserVolumeIntentAt <= USER_VOLUME_INTENT_WINDOW_MS;
+  }
+
+  function rememberStablePrimaryUnmuted(video) {
+    if (
+      preferredPrimaryMuted !== undefined ||
+      pendingPrimarySnapshots.has(video) ||
+      isAuxiliaryVideo(video)
+    ) {
+      return;
+    }
+
+    pendingPrimarySnapshots.add(video);
+    setTimeout(() => {
+      pendingPrimarySnapshots.delete(video);
+      if (
+        preferredPrimaryMuted === undefined &&
+        pendingPrimaryMuted === undefined &&
+        !isAuxiliaryVideo(video) &&
+        !hasActiveAuxiliaryPlayback() &&
+        !video.paused &&
+        video.muted === false
+      ) {
+        preferredPrimaryMuted = false;
+      }
+    }, PRIMARY_UNMUTED_SNAPSHOT_DELAY_MS);
+  }
+
+  function rememberPrimaryMute(video) {
+    if (
+      isAuxiliaryVideo(video) ||
+      pendingPrimaryMuted !== undefined ||
+      hasActiveAuxiliaryPlayback() ||
+      !hasRecentUserVolumeIntent()
+    ) {
+      return;
+    }
+
+    preferredPrimaryMuted = video.muted;
+  }
+
+  function restorePrimaryMute(video) {
+    if (
+      pendingPrimaryMuted === undefined ||
+      isAuxiliaryVideo(video)
+    ) {
+      return;
+    }
+
+    const muted = pendingPrimaryMuted;
+    pendingPrimaryMuted = undefined;
+    preferredPrimaryMuted = muted;
+    if (video.muted !== muted) {
+      video.muted = muted;
+    }
+  }
+
+  function restoreCurrentPrimaryMute() {
+    for (const video of document.querySelectorAll("video")) {
+      if (!isAuxiliaryVideo(video) && (video.currentSrc || video.src)) {
+        restorePrimaryMute(video);
+        if (pendingPrimaryMuted === undefined) {
+          return;
+        }
+      }
+    }
+  }
+
+  function advanceAuxiliaryPlayback(video) {
+    if (
+      advancedAuxiliaryVideos.has(video) ||
+      pendingAuxiliaryVideos.has(video)
+    ) {
+      return true;
+    }
+
+    if (
+      video.paused ||
+      video.readyState < 2 ||
+      !Array.isArray(playbackAdvanceListeners)
+    ) {
+      return false;
+    }
+
+    const listeners = playbackAdvanceListeners.filter(
+      (listener) => typeof listener === "function"
+    );
+    if (listeners.length === 0) {
+      return false;
+    }
+
+    if (preferredPrimaryMuted !== undefined) {
+      pendingPrimaryMuted = preferredPrimaryMuted;
+    }
+    pendingAuxiliaryVideos.add(video);
+    setTimeout(() => {
+      pendingAuxiliaryVideos.delete(video);
+      if (advancedAuxiliaryVideos.has(video)) {
+        return;
+      }
+
+      advancedAuxiliaryVideos.add(video);
+      for (const listener of listeners) {
+        try {
+          listener();
+        } catch (error) {
+          log("failed to advance auxiliary playback", error);
+        }
+      }
+
+      setTimeout(restoreCurrentPrimaryMute, PRIMARY_MUTE_RESTORE_DELAY_MS);
+      log("advanced auxiliary playback");
+    }, PLAYBACK_ADVANCE_DELAY_MS);
+    return true;
+  }
+
   function finishAuxiliaryVideo(video) {
-    if (!isAuxiliaryVideo(video)) {
+    if (!ownsPlaybackTransport || !isAuxiliaryVideo(video)) {
       return;
     }
 
     try {
+      if (advanceAuxiliaryPlayback(video)) {
+        return;
+      }
+
       video.muted = true;
       video.playbackRate = 16;
 
@@ -475,12 +748,30 @@
       subtree: true
     });
 
-    for (const eventName of ["loadedmetadata", "durationchange", "play", "playing"]) {
+    if (ownsPlaybackTransport) {
+      for (const eventName of ["loadedmetadata", "durationchange", "play", "playing"]) {
+        document.addEventListener(
+          eventName,
+          (event) => {
+            if (event.target instanceof HTMLVideoElement) {
+              finishAuxiliaryVideo(event.target);
+              if (eventName === "playing" && !isAuxiliaryVideo(event.target)) {
+                rememberStablePrimaryUnmuted(event.target);
+                setTimeout(() => restorePrimaryMute(event.target), 0);
+              }
+            }
+          },
+          true
+        );
+      }
+
+      document.addEventListener("pointerdown", noteUserVolumeIntent, true);
+      document.addEventListener("keydown", noteUserVolumeIntent, true);
       document.addEventListener(
-        eventName,
+        "volumechange",
         (event) => {
           if (event.target instanceof HTMLVideoElement) {
-            finishAuxiliaryVideo(event.target);
+            rememberPrimaryMute(event.target);
           }
         },
         true

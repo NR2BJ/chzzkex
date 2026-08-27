@@ -515,6 +515,92 @@
     }
   };
 
+  const initialLiveEdgeSync = {
+    route: "",
+    candidateVideo: null,
+    candidateSource: "",
+    candidateSince: 0,
+    decided: false,
+    deadlineAt: 0,
+
+    reset(route, now) {
+      this.route = route;
+      this.candidateVideo = null;
+      this.candidateSource = "";
+      this.candidateSince = 0;
+      this.decided = false;
+      this.deadlineAt = route ? now + 15000 : 0;
+    },
+
+    tick() {
+      const now = performance.now();
+      const route = isLiveRoute() ? location.pathname : "";
+      if (route !== this.route) {
+        this.reset(route, now);
+      }
+      if (!route || this.decided) {
+        return;
+      }
+      if (now > this.deadlineAt) {
+        this.decided = true;
+        return;
+      }
+
+      const video = mainVideo();
+      if (!video) {
+        return;
+      }
+      if (playbackState.manualTimelinePosition) {
+        this.decided = true;
+        return;
+      }
+
+      const source = video.currentSrc || video.src || "";
+      if (video !== this.candidateVideo || source !== this.candidateSource) {
+        this.candidateVideo = video;
+        this.candidateSource = source;
+        this.candidateSince = now;
+        return;
+      }
+      if (
+        now - this.candidateSince < 500 ||
+        video.paused ||
+        video.readyState < HTMLMediaElement.HAVE_CURRENT_DATA ||
+        !Number.isFinite(video.currentTime)
+      ) {
+        return;
+      }
+
+      const range = seekableWindow(video);
+      if (!range) {
+        return;
+      }
+
+      const target = core.initialLiveSeekTarget(
+        video.currentTime,
+        range.start,
+        range.end
+      );
+      this.decided = true;
+      if (target === null) {
+        return;
+      }
+
+      const previousTime = video.currentTime;
+      video.currentTime = target;
+      playbackState.manualTimelinePosition = false;
+      log("initial live edge synchronized", {
+        previousTime,
+        target,
+        rangeEnd: range.end
+      });
+    },
+
+    start() {
+      setInterval(() => this.tick(), 250);
+    }
+  };
+
   const loudness = {
     context: null,
     video: null,
@@ -2253,6 +2339,7 @@
   function start() {
     timelineAssist.start();
     playbackState.start();
+    initialLiveEdgeSync.start();
     loudness.start();
     watchTimer.start();
     followingRefresh.start();

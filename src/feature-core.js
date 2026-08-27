@@ -99,6 +99,29 @@
     return clamp(requested, start, safeEnd);
   }
 
+  function initialLiveSeekTarget(
+    currentTime,
+    start,
+    end,
+    minimumLagSeconds = 1,
+    liveSafetySeconds = 0.25
+  ) {
+    if (
+      ![currentTime, start, end, minimumLagSeconds, liveSafetySeconds].every(
+        Number.isFinite
+      ) ||
+      end <= start
+    ) {
+      return null;
+    }
+
+    const safeEnd = Math.max(start, end - Math.max(0, liveSafetySeconds));
+    const minimumLag = Math.max(0, minimumLagSeconds);
+    return end - currentTime > minimumLag && safeEnd > currentTime
+      ? safeEnd
+      : null;
+  }
+
   function hasUsableNativeTimeline(candidates) {
     return (Array.isArray(candidates) ? candidates : []).some(
       ({ custom, display, visibility, width, height }) =>
@@ -574,6 +597,7 @@
     gatedLoudnessDb,
     hasUsableNativeTimeline,
     hybridNormalizationGainDb,
+    initialLiveSeekTarget,
     isAtLiveEdge,
     isSidebarPreviewTarget,
     loudnessDbFromEnergy,

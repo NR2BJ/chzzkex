@@ -25,6 +25,9 @@
   const EVENT_TOKEN = String.fromCharCode(97, 100);
   const EVENT_TITLE_TOKEN = `${EVENT_TOKEN[0].toUpperCase()}${EVENT_TOKEN.slice(1)}`;
   const CONNECTION_TOKEN = String.fromCharCode(112, 50, 112);
+  const CONNECTION_PATH_FIELD = `${CONNECTION_TOKEN}Path`;
+  const DIRECT_CDN_SUFFIXES = ["pstatic.net", "navercdn.com"];
+  const nativeJsonParse = JSON.parse;
   const RUNTIME_FIELDS = Object.freeze({
     bootstrap: ["skip", "Pre", "Roll", EVENT_TITLE_TOKEN].join(""),
     state: String.fromCharCode(100, 97, 98),
@@ -139,6 +142,127 @@
     });
   }
 
+  function directPlaybackUrl(connectionPath) {
+    if (typeof connectionPath !== "string" || !connectionPath) {
+      return null;
+    }
+
+    try {
+      const encoded = new URL(
+        connectionPath,
+        "https://chzzk.naver.com/"
+      ).searchParams.get("cdn_url");
+      if (!encoded) {
+        return null;
+      }
+
+      const base64 = encoded
+        .replace(/-/g, "+")
+        .replace(/_/g, "/")
+        .padEnd(Math.ceil(encoded.length / 4) * 4, "=");
+      const url = new URL(globalThis.atob(base64));
+      const trustedHost = DIRECT_CDN_SUFFIXES.some(
+        (suffix) =>
+          url.hostname === suffix || url.hostname.endsWith(`.${suffix}`)
+      );
+
+      if (
+        url.protocol !== "https:" ||
+        url.username ||
+        url.password ||
+        (url.port && url.port !== "443") ||
+        !trustedHost
+      ) {
+        return null;
+      }
+
+      return url.href;
+    } catch {
+      return null;
+    }
+  }
+
+  function restoreDirectPlaybackPaths(playback, clearConnectionPath = false) {
+    if (!Array.isArray(playback.media)) {
+      return;
+    }
+
+    for (const media of playback.media) {
+      if (!isObject(media) || !["HLS", "LLHLS"].includes(media.mediaId)) {
+        continue;
+      }
+
+      const entries = [media];
+      if (Array.isArray(media.encodingTrack)) {
+        entries.push(...media.encodingTrack);
+      }
+
+      for (const entry of entries) {
+        if (!isObject(entry)) {
+          continue;
+        }
+
+        const directUrl = directPlaybackUrl(entry[CONNECTION_PATH_FIELD]);
+        if (directUrl) {
+          entry.path = directUrl;
+          if (clearConnectionPath) {
+            entry[CONNECTION_PATH_FIELD] = "";
+          }
+        }
+      }
+    }
+  }
+
+  function sanitizeKnownPlayback(value) {
+    restoreDirectPlaybackPaths(value);
+    stripConnectionApiEntries(value);
+    stripConnectionMetadata(value);
+    return value;
+  }
+
+  function sanitizeParsedPlayback(value) {
+    if (!isObject(value) || !Array.isArray(value.media)) {
+      return value;
+    }
+
+    const hasLiveMedia = value.media.some(
+      (media) => isObject(media) && ["HLS", "LLHLS"].includes(media.mediaId)
+    );
+    if (!hasLiveMedia) {
+      return value;
+    }
+
+    restoreDirectPlaybackPaths(value, true);
+    return value;
+  }
+
+  function sanitizeParsedPayload(value) {
+    if (isObject(value) && isObject(value.content)) {
+      const content = value.content;
+      const hasRuntimeState = Object.prototype.hasOwnProperty.call(
+        content,
+        RUNTIME_FIELDS.state
+      );
+      const looksLikeLivePayload =
+        hasRuntimeState &&
+        (Object.prototype.hasOwnProperty.call(content, "livePlaybackJson") ||
+          Object.prototype.hasOwnProperty.call(content, "liveId") ||
+          Object.prototype.hasOwnProperty.call(content, "channel") ||
+          Object.prototype.hasOwnProperty.call(content, RUNTIME_FIELDS.bootstrap));
+
+      if (looksLikeLivePayload) {
+        sanitizePlaybackBootstrap(
+          value,
+          Object.prototype.hasOwnProperty.call(content, "livePlaybackJson")
+            ? REQUEST_KIND.LIVE_DETAIL
+            : REQUEST_KIND.LIVE_STATUS
+        );
+      }
+    }
+
+    return sanitizeParsedPlayback(value);
+  }
+
   function sanitizePlaybackBootstrap(payload, requestKind) {
     if (!isObject(payload) || !isObject(payload.content)) {
       return payload;
@@ -156,10 +280,9 @@
     const playbackJson = payload.content.livePlaybackJson;
     if (typeof playbackJson === "string") {
       try {
-        const playback = JSON.parse(playbackJson);
+        const playback = nativeJsonParse(playbackJson);
         if (isObject(playback)) {
-          stripConnectionApiEntries(playback);
-          stripConnectionMetadata(playback);
+          sanitizeKnownPlayback(playback);
           payload.content.livePlaybackJson = JSON.stringify(playback);
         }
       } catch {
@@ -309,6 +432,8 @@
     RUNTIME_FIELDS,
     classifyRequest,
     rewritePayload,
+    sanitizeParsedPayload,
+    sanitizeParsedPlayback,
     shouldRewrite,
     shouldShortCircuit,
     syntheticPayload
