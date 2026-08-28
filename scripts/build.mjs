@@ -5,6 +5,7 @@ import {
   cp,
   mkdir,
   readFile,
+  rename,
   rm,
   stat,
   writeFile
@@ -90,15 +91,35 @@ async function stageRuntime(browser) {
   return browserDir;
 }
 
-function makeArchive(sourceDir, archivePath) {
-  const result = spawnSync(
-    "zip",
-    ["-X", "-q", "-r", archivePath, "manifest.json", ...runtimeEntries],
-    { cwd: sourceDir, encoding: "utf8" }
-  );
+async function makeArchive(sourceDir, archivePath) {
+  const entries = ["manifest.json", ...runtimeEntries];
+  const windowsArchivePath = archivePath.endsWith(".zip")
+    ? archivePath
+    : `${archivePath}.zip`;
+  const command = process.platform === "win32" ? "tar.exe" : "zip";
+  const args =
+    process.platform === "win32"
+      ? ["-a", "-cf", windowsArchivePath, ...entries]
+      : ["-X", "-q", "-r", archivePath, ...entries];
+  if (process.platform === "win32") {
+    await rm(windowsArchivePath, { force: true });
+  }
+  const result = spawnSync(command, args, {
+    cwd: sourceDir,
+    encoding: "utf8"
+  });
 
   if (result.status !== 0) {
-    throw new Error(result.stderr || result.stdout || "zip failed");
+    if (process.platform === "win32") {
+      await rm(windowsArchivePath, { force: true });
+    }
+    throw new Error(
+      result.error?.message || result.stderr || result.stdout || "zip failed"
+    );
+  }
+
+  if (windowsArchivePath !== archivePath) {
+    await rename(windowsArchivePath, archivePath);
   }
 }
 
@@ -117,8 +138,8 @@ await Promise.all([
   rm(chromePath, { force: true }),
   rm(firefoxPath, { force: true })
 ]);
-makeArchive(await stageRuntime("chrome"), chromePath);
-makeArchive(await stageRuntime("firefox"), firefoxPath);
+await makeArchive(await stageRuntime("chrome"), chromePath);
+await makeArchive(await stageRuntime("firefox"), firefoxPath);
 
 const checksums = [
   `${await sha256(chromePath)}  ${chromeName}`,

@@ -15,6 +15,7 @@
     OTHER: "other",
     LIVE_DETAIL: "live-detail",
     LIVE_STATUS: "live-status",
+    PLAYBACK_SOURCE: "playback-source",
     DISPLAY_STATUS: "display-status",
     PLAYBACK_EVENT: "playback-event",
     CURRENT_EVENT: "current-event",
@@ -66,6 +67,12 @@
     `/service/v[\\d.]+/lives/[^/]+/${EVENT_TOKEN}s/current/?$`
   );
 
+  const PLAYBACK_SOURCE_PATTERNS = Object.freeze([
+    /^\/service\/v\d+(?:\.\d+)*\/channels\/[^/]+\/live-playback-json\/?$/,
+    /^\/manage\/v\d+(?:\.\d+)*\/channels\/[^/]+\/watch-party\/source\/[^/]+\/?$/
+  ]);
+  const MAX_ENCODED_CDN_URL_LENGTH = 16 * 1024;
+
   function isObject(value) {
     return value !== null && typeof value === "object" && !Array.isArray(value);
   }
@@ -107,6 +114,10 @@
       return REQUEST_KIND.CURRENT_EVENT;
     }
 
+    if (PLAYBACK_SOURCE_PATTERNS.some((pattern) => pattern.test(path))) {
+      return REQUEST_KIND.PLAYBACK_SOURCE;
+    }
+
     if (/\/channels\/[^/]+\/live-detail\/?$/.test(path)) {
       return REQUEST_KIND.LIVE_DETAIL;
     }
@@ -123,26 +134,41 @@
   }
 
   function stripConnectionMetadata(value) {
-    if (Array.isArray(value)) {
-      value.forEach(stripConnectionMetadata);
-      return;
-    }
+    const pending = [value];
+    const visited = new WeakSet();
 
-    if (!isObject(value)) {
-      return;
-    }
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (
+        (!Array.isArray(current) && !isObject(current)) ||
+        visited.has(current)
+      ) {
+        continue;
+      }
+      visited.add(current);
 
-    for (const key of Object.keys(value)) {
-      if (looksLikeConnectionKey(key)) {
-        if (key.toLowerCase() === CONNECTION_TOKEN && typeof value[key] === "boolean") {
-          value[key] = false;
-        } else {
-          delete value[key];
+      if (Array.isArray(current)) {
+        for (const item of current) {
+          pending.push(item);
         }
         continue;
       }
 
-      stripConnectionMetadata(value[key]);
+      for (const key of Object.keys(current)) {
+        if (looksLikeConnectionKey(key)) {
+          if (
+            key.toLowerCase() === CONNECTION_TOKEN &&
+            typeof current[key] === "boolean"
+          ) {
+            current[key] = false;
+          } else {
+            delete current[key];
+          }
+          continue;
+        }
+
+        pending.push(current[key]);
+      }
     }
   }
 
@@ -151,14 +177,56 @@
       return;
     }
 
-    playback.api = playback.api.filter((entry) => {
-      const name = String(entry?.name || "").toLowerCase();
-      const path = String(entry?.path || "").toLowerCase();
-      return (
-        !name.includes(CONNECTION_TOKEN) &&
-        !path.includes(`/${CONNECTION_TOKEN}/`)
-      );
-    });
+    playback.api = playback.api.filter(
+      (entry) => !isConnectionApiEntry(entry)
+    );
+  }
+
+  function isConnectionApiEntry(entry) {
+    const name = String(entry?.name || "").toLowerCase();
+    const path = String(entry?.path || "").toLowerCase();
+    return (
+      name.includes(CONNECTION_TOKEN) ||
+      path.includes(CONNECTION_TOKEN)
+    );
+  }
+
+  function hasConnectionSignals(value) {
+    const pending = [value];
+    const visited = new WeakSet();
+
+    while (pending.length > 0) {
+      const current = pending.pop();
+      if (
+        (!Array.isArray(current) && !isObject(current)) ||
+        visited.has(current)
+      ) {
+        continue;
+      }
+      visited.add(current);
+
+      if (Array.isArray(current)) {
+        for (const item of current) {
+          pending.push(item);
+        }
+        continue;
+      }
+
+      for (const key of Object.keys(current)) {
+        if (looksLikeConnectionKey(key)) {
+          return true;
+        }
+        if (
+          key === "api" &&
+          Array.isArray(current[key]) &&
+          current[key].some(isConnectionApiEntry)
+        ) {
+          return true;
+        }
+        pending.push(current[key]);
+      }
+    }
+    return false;
   }
 
   function directPlaybackUrl(connectionPath) {
@@ -174,11 +242,24 @@
       if (!encoded) {
         return null;
       }
+      if (encoded.length > MAX_ENCODED_CDN_URL_LENGTH) {
+        return null;
+      }
 
-      const base64 = encoded
+      const normalized = encoded
+        .replace(/ /g, "+")
         .replace(/-/g, "+")
-        .replace(/_/g, "/")
-        .padEnd(Math.ceil(encoded.length / 4) * 4, "=");
+        .replace(/_/g, "/");
+      if (!/^[A-Za-z0-9+/]*={0,2}$/.test(normalized)) {
+        return null;
+      }
+
+      const unpadded = normalized.replace(/=+$/, "");
+      if (unpadded.length % 4 === 1) {
+        return null;
+      }
+
+      const base64 = unpadded.padEnd(Math.ceil(unpadded.length / 4) * 4, "=");
       const url = new URL(globalThis.atob(base64));
       const trustedHost = DIRECT_CDN_SUFFIXES.some(
         (suffix) =>
@@ -201,7 +282,7 @@
     }
   }
 
-  function restoreDirectPlaybackPaths(playback, clearConnectionPath = false) {
+  function restoreDirectPlaybackPaths(playback) {
     if (!Array.isArray(playback.media)) {
       return;
     }
@@ -224,9 +305,6 @@
         const directUrl = directPlaybackUrl(entry[CONNECTION_PATH_FIELD]);
         if (directUrl) {
           entry.path = directUrl;
-          if (clearConnectionPath) {
-            entry[CONNECTION_PATH_FIELD] = "";
-          }
         }
       }
     }
@@ -239,20 +317,78 @@
     return value;
   }
 
-  function sanitizeParsedPlayback(value) {
+  function isLivePlayback(value) {
     if (!isObject(value) || !Array.isArray(value.media)) {
-      return value;
+      return false;
     }
 
-    const hasLiveMedia = value.media.some(
+    return value.media.some(
       (media) => isObject(media) && ["HLS", "LLHLS"].includes(media.mediaId)
     );
-    if (!hasLiveMedia) {
+  }
+
+  function sanitizeParsedPlayback(value) {
+    if (!isLivePlayback(value)) {
       return value;
     }
 
-    restoreDirectPlaybackPaths(value, true);
-    return value;
+    return sanitizeKnownPlayback(value);
+  }
+
+  function sanitizeEmbeddedPlaybackFields(
+    content,
+    requireLivePlayback = false
+  ) {
+    if (!isObject(content)) {
+      return content;
+    }
+
+    let sanitizedPlayback = false;
+    for (const field of ["livePlaybackJson", "playbackJson"]) {
+      const playbackJson = content[field];
+      if (typeof playbackJson === "string") {
+        try {
+          const playback = nativeJsonParse(playbackJson);
+          if (
+            isObject(playback) &&
+            (!requireLivePlayback ||
+              (isLivePlayback(playback) && hasConnectionSignals(playback)))
+          ) {
+            sanitizeKnownPlayback(playback);
+            content[field] = JSON.stringify(playback);
+            sanitizedPlayback = true;
+          }
+        } catch {
+          // Keep the server response if CHZZK changes the playback format.
+        }
+        continue;
+      }
+
+      if (
+        isObject(playbackJson) &&
+        (!requireLivePlayback ||
+          (isLivePlayback(playbackJson) &&
+            hasConnectionSignals(playbackJson)))
+      ) {
+        sanitizeKnownPlayback(playbackJson);
+        sanitizedPlayback = true;
+      }
+    }
+
+    if (!requireLivePlayback || sanitizedPlayback) {
+      stripConnectionMetadata(content);
+    }
+    return content;
+  }
+
+  function sanitizePlaybackSource(payload) {
+    if (!isObject(payload) || !isObject(payload.content)) {
+      return payload;
+    }
+
+    sanitizeParsedPlayback(payload.content);
+    sanitizeEmbeddedPlaybackFields(payload.content);
+    return payload;
   }
 
   function sanitizeRealtimePlaybackEvent(value) {
@@ -275,6 +411,7 @@
 
     if (isObject(value) && isObject(value.content)) {
       const content = value.content;
+      sanitizeParsedPlayback(content);
       const hasRuntimeState = Object.prototype.hasOwnProperty.call(
         content,
         RUNTIME_FIELDS.state
@@ -293,6 +430,13 @@
             ? REQUEST_KIND.LIVE_DETAIL
             : REQUEST_KIND.LIVE_STATUS
         );
+      }
+
+      if (
+        Object.prototype.hasOwnProperty.call(content, "livePlaybackJson") ||
+        Object.prototype.hasOwnProperty.call(content, "playbackJson")
+      ) {
+        sanitizeEmbeddedPlaybackFields(content, true);
       }
     }
 
@@ -354,20 +498,7 @@
       return payload;
     }
 
-    const playbackJson = payload.content.livePlaybackJson;
-    if (typeof playbackJson === "string") {
-      try {
-        const playback = nativeJsonParse(playbackJson);
-        if (isObject(playback)) {
-          sanitizeKnownPlayback(playback);
-          payload.content.livePlaybackJson = JSON.stringify(playback);
-        }
-      } catch {
-        // Keep the server response if CHZZK changes the playback format.
-      }
-    }
-
-    stripConnectionMetadata(payload.content);
+    sanitizeEmbeddedPlaybackFields(payload.content);
     return payload;
   }
 
@@ -439,6 +570,7 @@
     ) {
       content.livePlaybackJson.liveId = false;
       content.livePlaybackJson.chatChannelId = false;
+      sanitizeEmbeddedPlaybackFields(content);
       return payload;
     }
 
@@ -454,6 +586,13 @@
       Object.prototype.hasOwnProperty.call(content, RUNTIME_FIELDS.bootstrap)
     ) {
       return sanitizePlaybackBootstrap(payload, REQUEST_KIND.LIVE_DETAIL);
+    }
+
+    if (
+      Object.prototype.hasOwnProperty.call(content, "livePlaybackJson") ||
+      Object.prototype.hasOwnProperty.call(content, "playbackJson")
+    ) {
+      return sanitizePlaybackSource(payload);
     }
 
     return payload;
@@ -480,6 +619,8 @@
       case REQUEST_KIND.LIVE_DETAIL:
       case REQUEST_KIND.LIVE_STATUS:
         return sanitizePlaybackBootstrap(payload, requestKind);
+      case REQUEST_KIND.PLAYBACK_SOURCE:
+        return sanitizePlaybackSource(payload);
       case REQUEST_KIND.DISPLAY_STATUS:
         return inactiveDisplayStatus(payload);
       case REQUEST_KIND.PLAYBACK_EVENT:

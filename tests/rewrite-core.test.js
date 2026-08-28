@@ -35,6 +35,14 @@ test("classifies the current CHZZK playback endpoints", () => {
       core.REQUEST_KIND.LIVE_STATUS
     ],
     [
+      "https://api.chzzk.naver.com/service/v1.1/channels/channel-id/live-playback-json?tm=true",
+      core.REQUEST_KIND.PLAYBACK_SOURCE
+    ],
+    [
+      "https://api.chzzk.naver.com/manage/v1/channels/channel-id/watch-party/source/source-id",
+      core.REQUEST_KIND.PLAYBACK_SOURCE
+    ],
+    [
       "https://api.chzzk.naver.com/service/t/opaque-token",
       core.REQUEST_KIND.TUNNELED_API
     ]
@@ -42,6 +50,20 @@ test("classifies the current CHZZK playback endpoints", () => {
 
   for (const [url, expected] of cases) {
     assert.equal(core.classifyRequest(url), expected);
+  }
+});
+
+test("leaves playback-source near-miss routes unclassified", () => {
+  const urls = [
+    "https://api.chzzk.naver.com/manage/v1/watch-party/source/source-id/channel",
+    "https://api.chzzk.naver.com/manage/v1/channels/channel-id/watch-party/source/source-id/status",
+    "https://api.chzzk.naver.com/proxy/service/v1.1/channels/channel-id/live-playback-json",
+    "https://api.chzzk.naver.com/service/v./channels/channel-id/live-playback-json",
+    "https://api.chzzk.naver.com/service/v1..2/channels/channel-id/live-playback-json"
+  ];
+
+  for (const url of urls) {
+    assert.equal(core.classifyRequest(url), core.REQUEST_KIND.OTHER);
   }
 });
 
@@ -205,6 +227,222 @@ test("normalizes a parsed live payload even when its request route was missed", 
   assert.equal(rewritten.content[FIELDS.bootstrap], true);
 });
 
+test("restores standard Base64 paths whose plus signs were parsed as spaces", () => {
+  const direct720 =
+    "https://nvelop-livecloud.pstatic.net/channel/720p/playlist.m3u8?token=A~A";
+  const encoded720 = Buffer.from(direct720).toString("base64");
+  assert.match(encoded720, /\+/);
+
+  const playback = {
+    meta: { [CONNECTION_TOKEN]: true },
+    api: [
+      {
+        name: CONNECTION_TOKEN + "-config",
+        path: "https://apis.naver.com/" + CONNECTION_TOKEN + "/config"
+      },
+      { name: "qoeConfig", path: "https://apis.naver.com/policy" }
+    ],
+    media: [
+      {
+        mediaId: "LLHLS",
+        encodingTrack: [
+          {
+            encodingTrackId: "720p",
+            [CONNECTION_FIELDS.path]: "/channel/720p?cdn_url=" + encoded720
+          }
+        ]
+      }
+    ]
+  };
+
+  core.sanitizeParsedPlayback(playback);
+
+  const track = playback.media[0].encodingTrack[0];
+  assert.equal(track.path, direct720);
+  assert.equal(CONNECTION_FIELDS.path in track, false);
+  assert.equal(playback.meta[CONNECTION_TOKEN], false);
+  assert.equal(playback.api.length, 1);
+});
+
+test("sanitizes time-machine and watch-party playback source envelopes", () => {
+  const direct720 =
+    "https://nvelop-livecloud.pstatic.net/channel/720p/playlist.m3u8?token=A~A";
+  const encoded720 = Buffer.from(direct720).toString("base64");
+  const playback = {
+    meta: { [CONNECTION_TOKEN]: true },
+    api: [
+      {
+        name: CONNECTION_TOKEN + "-config",
+        path: "https://apis.naver.com/" + CONNECTION_TOKEN + "/config"
+      },
+      { name: "qoeConfig", path: "https://apis.naver.com/policy" }
+    ],
+    media: [
+      {
+        mediaId: "HLS",
+        encodingTrack: [
+          {
+            encodingTrackId: "720p",
+            [CONNECTION_FIELDS.path]: "/channel/720p?cdn_url=" + encoded720
+          }
+        ]
+      }
+    ]
+  };
+
+  for (const field of ["playbackJson", "livePlaybackJson"]) {
+    const payload = {
+      code: 200,
+      content: {
+        [field]: JSON.stringify(playback),
+        [CONNECTION_FIELDS.quality]: ["720p"]
+      }
+    };
+
+    const rewritten = core.rewritePayload(
+      core.REQUEST_KIND.PLAYBACK_SOURCE,
+      payload
+    );
+    const rewrittenPlayback = JSON.parse(rewritten.content[field]);
+    const track = rewrittenPlayback.media[0].encodingTrack[0];
+
+    assert.equal(track.path, direct720);
+    assert.equal(CONNECTION_FIELDS.path in track, false);
+    assert.equal(rewrittenPlayback.meta[CONNECTION_TOKEN], false);
+    assert.equal(rewrittenPlayback.api.length, 1);
+    assert.equal(CONNECTION_FIELDS.quality in rewritten.content, false);
+  }
+});
+
+test("sanitizes embedded playback fields when an outer route is missed", () => {
+  const playback = {
+    meta: { [CONNECTION_TOKEN]: true },
+    api: [
+      {
+        name: CONNECTION_TOKEN + "-config",
+        path: "https://apis.naver.com/" + CONNECTION_TOKEN + "/config"
+      }
+    ],
+    media: [
+      {
+        mediaId: "HLS",
+        encodingTrack: [
+          {
+            encodingTrackId: "480p",
+            [CONNECTION_FIELDS.path]: "/channel/480p?cdn_url=invalid"
+          }
+        ]
+      }
+    ]
+  };
+  const payload = {
+    content: {
+      [FIELDS.state]: true,
+      channel: { channelId: "channel-id" },
+      playbackJson: JSON.stringify(playback),
+      [CONNECTION_FIELDS.quality]: ["480p"]
+    }
+  };
+
+  core.sanitizeParsedPayload(payload);
+
+  const rewrittenPlayback = JSON.parse(payload.content.playbackJson);
+  assert.equal(rewrittenPlayback.meta[CONNECTION_TOKEN], false);
+  assert.equal(rewrittenPlayback.api.length, 0);
+  assert.equal(
+    CONNECTION_FIELDS.path in rewrittenPlayback.media[0].encodingTrack[0],
+    false
+  );
+  assert.equal(CONNECTION_FIELDS.quality in payload.content, false);
+});
+
+test("preserves unrelated embedded fields in the global parse fallback", () => {
+  const policyField = CONNECTION_TOKEN + "Policy";
+  const originalString =
+    '  { "kind": "unrelated", "' + policyField + '": "keep" }\n';
+  const payload = {
+    content: {
+      playbackJson: {
+        kind: "unrelated",
+        [policyField]: "keep"
+      },
+      livePlaybackJson: originalString
+    }
+  };
+
+  core.sanitizeParsedPayload(payload);
+
+  assert.deepEqual(payload.content.playbackJson, {
+    kind: "unrelated",
+    [policyField]: "keep"
+  });
+  assert.equal(payload.content.livePlaybackJson, originalString);
+});
+
+test("sanitizes cyclic and deeply nested playback objects without recursion overflow", () => {
+  const playback = {
+    meta: { [CONNECTION_TOKEN]: true },
+    api: [
+      {
+        name: "transportConfig",
+        path: "https://apis.naver.com/config?mode=" + CONNECTION_TOKEN
+      }
+    ],
+    media: [{ mediaId: "HLS", encodingTrack: [] }]
+  };
+  playback.self = playback;
+
+  let nested = playback.meta;
+  for (let index = 0; index < 20_000; index += 1) {
+    nested.next = {};
+    nested = nested.next;
+  }
+  nested[CONNECTION_TOKEN + "Policy"] = true;
+
+  const payload = { content: { playbackJson: playback } };
+  payload.content.self = payload.content;
+
+  assert.doesNotThrow(() => core.sanitizeParsedPayload(payload));
+  assert.equal(playback.meta[CONNECTION_TOKEN], false);
+  assert.equal(playback.api.length, 0);
+  assert.equal(CONNECTION_TOKEN + "Policy" in nested, false);
+  assert.equal(payload.content.self, payload.content);
+});
+
+test("sanitizes a playback object used directly as response content", () => {
+  const payload = {
+    content: {
+      meta: { [CONNECTION_TOKEN]: true },
+      api: [
+        {
+          name: CONNECTION_TOKEN + "-config",
+          path: "https://apis.naver.com/" + CONNECTION_TOKEN + "/config"
+        }
+      ],
+      media: [
+        {
+          mediaId: "HLS",
+          encodingTrack: [
+            {
+              encodingTrackId: "480p",
+              [CONNECTION_FIELDS.path]: "/channel/480p?cdn_url=invalid"
+            }
+          ]
+        }
+      ]
+    }
+  };
+
+  core.sanitizeParsedPayload(payload);
+
+  assert.equal(payload.content.meta[CONNECTION_TOKEN], false);
+  assert.equal(payload.content.api.length, 0);
+  assert.equal(
+    CONNECTION_FIELDS.path in payload.content.media[0].encodingTrack[0],
+    false
+  );
+});
+
 test("neutralizes realtime playback start notifications", () => {
   const eventType = ["LIVE", "MID", "ROLL", EVENT_TOKEN.toUpperCase()].join("_");
   const frame = {
@@ -241,7 +479,7 @@ test("leaves unrelated realtime notifications unchanged", () => {
   assert.equal(JSON.stringify(frame), before);
 });
 
-test("rejects an untrusted direct playback host", () => {
+test("rejects an untrusted direct playback host without exposing grid metadata", () => {
   const encoded = Buffer.from(
     "https://pstatic.net.example.test/channel/1080p/playlist.m3u8"
   ).toString("base64url");
@@ -263,9 +501,32 @@ test("rejects an untrusted direct playback host", () => {
 
   assert.equal("path" in playback.media[0].encodingTrack[0], false);
   assert.equal(
-    playback.media[0].encodingTrack[0][CONNECTION_FIELDS.path],
-    `/channel/1080p?cdn_url=${encoded}`
+    CONNECTION_FIELDS.path in playback.media[0].encodingTrack[0],
+    false
   );
+});
+
+test("rejects oversized encoded playback URLs before decoding", () => {
+  const playback = {
+    media: [
+      {
+        mediaId: "HLS",
+        encodingTrack: [
+          {
+            encodingTrackId: "1080p",
+            [CONNECTION_FIELDS.path]:
+              "/channel/1080p?cdn_url=" + "A".repeat(16 * 1024 + 1)
+          }
+        ]
+      }
+    ]
+  };
+
+  core.sanitizeParsedPlayback(playback);
+
+  const track = playback.media[0].encodingTrack[0];
+  assert.equal("path" in track, false);
+  assert.equal(CONNECTION_FIELDS.path in track, false);
 });
 
 test("rewrites tunneled playback decisions by response shape", () => {
@@ -399,4 +660,89 @@ test("rewrites tunneled playback bootstrap data without replacing tracks", () =>
     ["1080p", "480p"]
   );
   assert.equal(playback.api.length, 1);
+});
+
+test("rewrites tunneled playback-source data without bootstrap fields", () => {
+  const payload = {
+    code: 200,
+    content: {
+      playbackJson: JSON.stringify({
+        meta: { [CONNECTION_TOKEN]: true },
+        api: [
+          {
+            name: CONNECTION_TOKEN + "-config",
+            path: "https://apis.naver.com/" + CONNECTION_TOKEN + "/config"
+          }
+        ],
+        media: [
+          {
+            mediaId: "LLHLS",
+            encodingTrack: [
+              {
+                encodingTrackId: "720p",
+                [CONNECTION_FIELDS.path]: "/channel/720p?cdn_url=invalid"
+              }
+            ]
+          }
+        ]
+      }),
+      [CONNECTION_FIELDS.quality]: ["720p"]
+    }
+  };
+
+  const rewritten = core.rewritePayload(core.REQUEST_KIND.TUNNELED_API, payload);
+  const playback = JSON.parse(rewritten.content.playbackJson);
+
+  assert.equal(playback.meta[CONNECTION_TOKEN], false);
+  assert.equal(playback.api.length, 0);
+  assert.equal(
+    CONNECTION_FIELDS.path in playback.media[0].encodingTrack[0],
+    false
+  );
+  assert.equal(CONNECTION_FIELDS.quality in rewritten.content, false);
+  assert.equal(FIELDS.bootstrap in rewritten.content, false);
+});
+
+test("sanitizes tunneled object playback before disabling live IDs", () => {
+  const payload = {
+    code: 200,
+    content: {
+      livePlaybackJson: {
+        liveId: "live-id",
+        chatChannelId: "chat-id",
+        meta: { [CONNECTION_TOKEN]: true },
+        api: [
+          {
+            name: CONNECTION_TOKEN + "-config",
+            path: "https://apis.naver.com/" + CONNECTION_TOKEN + "/config"
+          }
+        ],
+        media: [
+          {
+            mediaId: "HLS",
+            encodingTrack: [
+              {
+                encodingTrackId: "720p",
+                [CONNECTION_FIELDS.path]: "/channel/720p?cdn_url=invalid"
+              }
+            ]
+          }
+        ]
+      },
+      [CONNECTION_FIELDS.quality]: ["720p"]
+    }
+  };
+
+  const rewritten = core.rewritePayload(core.REQUEST_KIND.TUNNELED_API, payload);
+  const playback = rewritten.content.livePlaybackJson;
+
+  assert.equal(playback.liveId, false);
+  assert.equal(playback.chatChannelId, false);
+  assert.equal(playback.meta[CONNECTION_TOKEN], false);
+  assert.equal(playback.api.length, 0);
+  assert.equal(
+    CONNECTION_FIELDS.path in playback.media[0].encodingTrack[0],
+    false
+  );
+  assert.equal(CONNECTION_FIELDS.quality in rewritten.content, false);
 });

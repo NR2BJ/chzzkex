@@ -48,10 +48,16 @@ function createRuntime(options = {}) {
   const fetchCalls = [];
   const subtleDecryptCalls = [];
   const intervalCallbacks = [];
+  const mutationCallbacks = [];
   const timeoutCallbacks = [];
   const videos = [];
   const classNames = new Set();
   const auxiliaryClassNames = new Set();
+  const playbackRejectionClassNames = new Set();
+  const playbackRejectionAttributes = new Map();
+  const playbackRejectionBackdropClassNames = new Set();
+  const playbackRejectionBackdropAttributes = new Map();
+  let playbackRejectionPresent = Boolean(options.playbackRejectionPresent);
   let noticeCloseClicks = 0;
   const auxiliaryElement = {
     classList: {
@@ -60,8 +66,50 @@ function createRuntime(options = {}) {
       }
     }
   };
+  const bodyElement = {};
+  const playbackRejectionBackdropParent =
+    options.playbackRejectionBackdropNested ? {} : bodyElement;
+  const playbackRejectionBackdrop = {
+    parentElement: playbackRejectionBackdropParent,
+    classList: {
+      add(name) {
+        playbackRejectionBackdropClassNames.add(name);
+      }
+    },
+    setAttribute(name, value) {
+      playbackRejectionBackdropAttributes.set(name, value);
+    }
+  };
+  const playbackRejectionElement = {
+    parentElement: playbackRejectionBackdrop,
+    classList: {
+      add(name) {
+        playbackRejectionClassNames.add(name);
+      }
+    },
+    getAttribute(name) {
+      const baseAttributes = {
+        "aria-modal": "true",
+        "data-nlog-area": "ad_blocking_info_layer",
+        role: "alertdialog"
+      };
+      return playbackRejectionAttributes.has(name)
+        ? playbackRejectionAttributes.get(name)
+        : baseAttributes[name] ?? null;
+    },
+    setAttribute(name, value) {
+      playbackRejectionAttributes.set(name, value);
+    }
+  };
+  playbackRejectionBackdrop.childElementCount =
+    options.playbackRejectionBackdropHasSibling ? 2 : 1;
+  playbackRejectionBackdrop.firstElementChild = playbackRejectionElement;
 
   class FakeMutationObserver {
+    constructor(callback) {
+      mutationCallbacks.push(callback);
+    }
+
     observe() {}
   }
 
@@ -158,6 +206,7 @@ function createRuntime(options = {}) {
   }
 
   const document = {
+    body: bodyElement,
     documentElement: {
       classList: {
         toggle(name, enabled) {
@@ -194,6 +243,9 @@ function createRuntime(options = {}) {
       }
       if (selector.includes("VideoContainerEl")) {
         return [auxiliaryElement];
+      }
+      if (selector.includes("_blocking_info_layer")) {
+        return playbackRejectionPresent ? [playbackRejectionElement] : [];
       }
       return [];
     }
@@ -243,14 +295,15 @@ function createRuntime(options = {}) {
         headers: { "content-type": "application/octet-stream" }
       });
     }
+    const payload = options.fetchPayload || {
+      code: 200,
+      content: {
+        [EVENT_FIELDS.state]: true,
+        [EVENT_FIELDS.bootstrap]: false
+      }
+    };
     return new Response(
-      JSON.stringify({
-        code: 200,
-        content: {
-          [EVENT_FIELDS.state]: true,
-          [EVENT_FIELDS.bootstrap]: false
-        }
-      }),
+      JSON.stringify(payload),
       { headers: { "content-type": "application/json" } }
     );
   };
@@ -284,6 +337,11 @@ function createRuntime(options = {}) {
     },
     fetchCalls,
     intervalCallbacks,
+    flushMutations() {
+      for (const callback of mutationCallbacks) {
+        callback([]);
+      }
+    },
     flushTimeouts(delay) {
       for (const entry of timeoutCallbacks.filter((entry) => entry.delay === delay)) {
         entry.callback();
@@ -292,6 +350,13 @@ function createRuntime(options = {}) {
     nativeFetch,
     nativeXhrOpen,
     nativeXhrSend,
+    playbackRejectionAttributes,
+    playbackRejectionBackdropAttributes,
+    playbackRejectionBackdropClassNames,
+    playbackRejectionClassNames,
+    setPlaybackRejectionPresent(present) {
+      playbackRejectionPresent = present;
+    },
     subtleDecryptCalls,
     noticeCloseClicks() {
       return noticeCloseClicks;
@@ -315,6 +380,54 @@ test("handles classified fetches before stored settings arrive", async () => {
   });
   assert.equal(runtime.classNames.has("chzzk-ex-playback-active"), true);
   assert.equal(runtime.auxiliaryClassNames.has("chzzk-ex-auxiliary"), true);
+});
+
+test("rewrites playback-source fetch responses before Response.json", async () => {
+  const direct720 =
+    "https://nvelop-livecloud.pstatic.net/channel/720p/playlist.m3u8?token=A~A";
+  const encoded720 = Buffer.from(direct720).toString("base64");
+  const runtime = createRuntime({
+    fetchPayload: {
+      code: 200,
+      content: {
+        playbackJson: JSON.stringify({
+          meta: { [CONNECTION_TOKEN]: true },
+          api: [
+            {
+              name: CONNECTION_TOKEN + "-config",
+              path: "https://apis.naver.com/" + CONNECTION_TOKEN + "/config"
+            }
+          ],
+          media: [
+            {
+              mediaId: "LLHLS",
+              encodingTrack: [
+                {
+                  encodingTrackId: "720p",
+                  [CONNECTION_TOKEN + "Path"]:
+                    "/channel/720p?cdn_url=" + encoded720
+                }
+              ]
+            }
+          ]
+        }),
+        [CONNECTION_TOKEN + "Quality"]: ["720p"]
+      }
+    }
+  });
+
+  const response = await runtime.context.fetch(
+    "https://api.chzzk.naver.com/service/v1.1/channels/id/live-playback-json?tm=true"
+  );
+  const payload = await response.json();
+  const playback = JSON.parse(payload.content.playbackJson);
+  const track = playback.media[0].encodingTrack[0];
+
+  assert.equal(track.path, direct720);
+  assert.equal(CONNECTION_TOKEN + "Path" in track, false);
+  assert.equal(playback.meta[CONNECTION_TOKEN], false);
+  assert.equal(playback.api.length, 0);
+  assert.equal(CONNECTION_TOKEN + "Quality" in payload.content, false);
 });
 
 test("restores the direct path when the player parses playback data", () => {
@@ -348,11 +461,11 @@ test("restores the direct path when the player parses playback data", () => {
 
   assert.equal(playback.media[0].encodingTrack[0].path, direct1080);
   assert.equal(
-    playback.media[0].encodingTrack[0][`${CONNECTION_TOKEN}Path`],
-    ""
+    CONNECTION_TOKEN + "Path" in playback.media[0].encodingTrack[0],
+    false
   );
-  assert.equal(playback.meta[CONNECTION_TOKEN], true);
-  assert.equal(playback.api.length, 2);
+  assert.equal(playback.meta[CONNECTION_TOKEN], false);
+  assert.equal(playback.api.length, 1);
 });
 
 test("suppresses only the playback rejection listener slot", () => {
@@ -594,6 +707,66 @@ test("sends XHR immediately without waiting for stored settings", () => {
   assert.equal(runtime.classNames.has("chzzk-ex-playback-active"), true);
 });
 
+test("rewrites playback-source XHR text and JSON responses", () => {
+  const runtime = createRuntime();
+  const sourcePayload = {
+    code: 200,
+    content: {
+      playbackJson: JSON.stringify({
+        meta: { [CONNECTION_TOKEN]: true },
+        api: [
+          {
+            name: CONNECTION_TOKEN + "-config",
+            path: "https://apis.naver.com/" + CONNECTION_TOKEN + "/config"
+          }
+        ],
+        media: [
+          {
+            mediaId: "HLS",
+            encodingTrack: [
+              {
+                encodingTrackId: "720p",
+                [CONNECTION_TOKEN + "Path"]:
+                  "/channel/720p?cdn_url=invalid"
+              }
+            ]
+          }
+        ]
+      }),
+      [CONNECTION_TOKEN + "Quality"]: ["720p"]
+    }
+  };
+  const responses = [];
+
+  for (const responseType of ["", "json"]) {
+    const xhr = new runtime.context.XMLHttpRequest();
+    xhr.open(
+      "GET",
+      "https://api.chzzk.naver.com/manage/v1/channels/channel-id/watch-party/source/source-id"
+    );
+    xhr.responseType = responseType;
+    xhr._readyState = runtime.context.XMLHttpRequest.DONE;
+    if (responseType === "json") {
+      xhr._response = sourcePayload;
+      responses.push(xhr.response);
+    } else {
+      xhr._responseText = JSON.stringify(sourcePayload);
+      responses.push(JSON.parse(xhr.responseText));
+    }
+  }
+
+  for (const payload of responses) {
+    const playback = JSON.parse(payload.content.playbackJson);
+    assert.equal(playback.meta[CONNECTION_TOKEN], false);
+    assert.equal(playback.api.length, 0);
+    assert.equal(
+      CONNECTION_TOKEN + "Path" in playback.media[0].encodingTrack[0],
+      false
+    );
+    assert.equal(CONNECTION_TOKEN + "Quality" in payload.content, false);
+  }
+});
+
 test("keeps unrelated XHR instances indistinguishable from the native surface", () => {
   const runtime = createRuntime();
   const xhr = new runtime.context.XMLHttpRequest();
@@ -683,6 +856,53 @@ test("rewrites only decoded protected tunnel payloads", () => {
   assert.equal(rewrittenPlayback.meta[CONNECTION_TOKEN], false);
   assert.equal(rewrittenPlayback.api.length, 1);
   assert.equal(rewrittenPlayback.media[0].encodingTrack[0].encodingTrackId, "1080p");
+});
+
+test("rewrites playback-source data in decoded protected tunnels", () => {
+  const runtime = createRuntime();
+  const originalText = JSON.stringify({
+    code: 200,
+    content: {
+      playbackJson: JSON.stringify({
+        meta: { [CONNECTION_TOKEN]: true },
+        api: [
+          {
+            name: CONNECTION_TOKEN + "-config",
+            path: "https://apis.naver.com/" + CONNECTION_TOKEN + "/config"
+          }
+        ],
+        media: [
+          {
+            mediaId: "LLHLS",
+            encodingTrack: [
+              {
+                encodingTrackId: "720p",
+                [CONNECTION_TOKEN + "Path"]:
+                  "/channel/720p?cdn_url=invalid"
+              }
+            ]
+          }
+        ]
+      }),
+      [CONNECTION_TOKEN + "Quality"]: ["720p"]
+    }
+  });
+  const bytes = new TextEncoder().encode(originalText);
+  const tunnelDecoder = new runtime.context.TextDecoder("utf-8", {
+    fatal: true,
+    ignoreBOM: false
+  });
+
+  const rewritten = JSON.parse(tunnelDecoder.decode(bytes));
+  const playback = JSON.parse(rewritten.content.playbackJson);
+
+  assert.equal(playback.meta[CONNECTION_TOKEN], false);
+  assert.equal(playback.api.length, 0);
+  assert.equal(
+    CONNECTION_TOKEN + "Path" in playback.media[0].encodingTrack[0],
+    false
+  );
+  assert.equal(CONNECTION_TOKEN + "Quality" in rewritten.content, false);
 });
 
 test("rewrites protected schedules when the player creates transport bytes", () => {
@@ -852,19 +1072,98 @@ test("preserves opaque tunnel responses byte-for-byte", async () => {
   );
 });
 
-test("does not dismiss the playback notice automatically", () => {
-  const runtime = createRuntime();
+test("hides the dedicated playback rejection layer without clicking generic notices", () => {
+  const runtime = createRuntime({ playbackRejectionPresent: true });
 
-  for (const callback of runtime.intervalCallbacks) {
-    callback();
-  }
+  runtime.playbackRejectionClassNames.clear();
+  runtime.playbackRejectionAttributes.clear();
+  runtime.playbackRejectionBackdropClassNames.clear();
+  runtime.playbackRejectionBackdropAttributes.clear();
+  runtime.flushMutations();
 
+  assert.equal(
+    runtime.playbackRejectionClassNames.has(
+      "chzzk-ex-playback-rejection-hidden"
+    ),
+    true
+  );
+  assert.equal(runtime.playbackRejectionAttributes.get("aria-hidden"), "true");
+  assert.equal(runtime.playbackRejectionAttributes.get("inert"), "");
+  assert.equal(
+    runtime.playbackRejectionBackdropClassNames.has(
+      "chzzk-ex-playback-rejection-hidden"
+    ),
+    true
+  );
+  assert.equal(
+    runtime.playbackRejectionBackdropAttributes.get("aria-hidden"),
+    "true"
+  );
+  assert.equal(
+    runtime.classNames.has("chzzk-ex-playback-rejection-active"),
+    true
+  );
   assert.equal(runtime.noticeCloseClicks(), 0);
+
+  runtime.setPlaybackRejectionPresent(false);
+  runtime.flushMutations();
+  assert.equal(
+    runtime.classNames.has("chzzk-ex-playback-rejection-active"),
+    false
+  );
 });
+
+for (const [structure, options] of [
+  ["nested backdrop", { playbackRejectionBackdropNested: true }],
+  ["backdrop with a sibling", { playbackRejectionBackdropHasSibling: true }]
+]) {
+  test(`hides only the playback rejection layer for a ${structure}`, () => {
+    const runtime = createRuntime({
+      playbackRejectionPresent: true,
+      ...options
+    });
+
+    runtime.playbackRejectionClassNames.clear();
+    runtime.playbackRejectionAttributes.clear();
+    runtime.playbackRejectionBackdropClassNames.clear();
+    runtime.playbackRejectionBackdropAttributes.clear();
+    runtime.flushMutations();
+
+    assert.equal(
+      runtime.playbackRejectionClassNames.has(
+        "chzzk-ex-playback-rejection-hidden"
+      ),
+      true
+    );
+    assert.equal(runtime.playbackRejectionAttributes.get("aria-hidden"), "true");
+    assert.equal(runtime.playbackRejectionAttributes.get("inert"), "");
+    assert.equal(runtime.playbackRejectionBackdropClassNames.size, 0);
+    assert.equal(runtime.playbackRejectionBackdropAttributes.size, 0);
+    assert.equal(
+      runtime.classNames.has("chzzk-ex-playback-rejection-active"),
+      false
+    );
+    assert.equal(runtime.noticeCloseClicks(), 0);
+  });
+}
 
 test("keeps auxiliary containers measurable for the current player guard", () => {
   const css = fs.readFileSync(path.join(root, "src/playback.css"), "utf8");
 
   assert.match(css, /visibility:\s*hidden/);
   assert.doesNotMatch(css, /opacity:\s*0/);
+});
+
+test("hides the dedicated playback rejection layer before it can be shown", () => {
+  const css = fs.readFileSync(path.join(root, "src/playback.css"), "utf8");
+
+  assert.match(
+    css,
+    /^\[data-nlog-area=["']ad_blocking_info_layer["']\]/m
+  );
+  assert.match(css, /display:\s*none\s*!important/);
+  assert.match(css, /pointer-events:\s*none\s*!important/);
+  assert.match(css, /chzzk-ex-playback-rejection-active\s+body/);
+  assert.match(css, /overflow:\s*auto\s*!important/);
+  assert.match(css, /padding-right:\s*0\s*!important/);
 });

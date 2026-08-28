@@ -2,3 +2,15 @@ html.chzzk-ex-playback-active .chzzk-ex-auxiliary {
   visibility: hidden !important;
   pointer-events: none !important;
 }
+
+[data-nlog-area="ad_blocking_info_layer"],
+.chzzk-ex-playback-rejection-hidden {
+  display: none !important;
+  visibility: hidden !important;
+  pointer-events: none !important;
+}
+
+html.chzzk-ex-playback-rejection-active body {
+  overflow: auto !important;
+  padding-right: 0 !important;
+}

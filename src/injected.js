@@ -61,6 +61,12 @@
     `${KOREAN_EVENT_LABEL}|\\b${EVENT_TOKEN}\\b`,
     "i"
   );
+  const PLAYBACK_REJECTION_LAYER_SELECTOR =
+    `[data-nlog-area='${EVENT_TOKEN}_blocking_info_layer']`;
+  const PLAYBACK_REJECTION_HIDDEN_CLASS =
+    "chzzk-ex-playback-rejection-hidden";
+  const PLAYBACK_REJECTION_ACTIVE_CLASS =
+    "chzzk-ex-playback-rejection-active";
   const AUXILIARY_CONTAINER_CLASS = "chzzk-ex-auxiliary";
   const AUXILIARY_MEDIA_HOST_PATTERN = /(^|\.)((tvetamovie\.pstatic\.net)|(glad-vod\.pstatic\.net)|(video-gfa\.pstatic\.net))$/i;
 
@@ -199,8 +205,44 @@
     }
   }
 
+  function hidePlaybackRejectionElement(element) {
+    if (element && element !== document.body) {
+      element.classList.add(PLAYBACK_REJECTION_HIDDEN_CLASS);
+      element.setAttribute("aria-hidden", "true");
+      element.setAttribute("inert", "");
+    }
+  }
+
+  function hidePlaybackRejectionLayers() {
+    const layers = document.querySelectorAll(
+      PLAYBACK_REJECTION_LAYER_SELECTOR
+    );
+    let hasCurrentModalLayer = false;
+    for (const element of layers) {
+      hidePlaybackRejectionElement(element);
+
+      const backdrop = element.parentElement;
+      if (
+        element.getAttribute("role") === "alertdialog" &&
+        element.getAttribute("aria-modal") === "true" &&
+        backdrop?.parentElement === document.body &&
+        backdrop.childElementCount === 1 &&
+        backdrop.firstElementChild === element
+      ) {
+        hasCurrentModalLayer = true;
+        hidePlaybackRejectionElement(backdrop);
+      }
+    }
+
+    document.documentElement?.classList.toggle(
+      PLAYBACK_REJECTION_ACTIVE_CLASS,
+      hasCurrentModalLayer
+    );
+  }
+
   function applyVisualGuard() {
     markAuxiliaryContainers();
+    hidePlaybackRejectionLayers();
     document.documentElement?.classList.toggle(
       "chzzk-ex-playback-active",
       true
@@ -935,6 +977,7 @@
     }
 
     markAuxiliaryContainers();
+    hidePlaybackRejectionLayers();
 
     const skipButtons = document.querySelectorAll("button, [role='button']");
     for (const button of skipButtons) {
