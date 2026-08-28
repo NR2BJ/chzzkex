@@ -11,6 +11,16 @@
     configurable: true
   });
 })(typeof globalThis !== "undefined" ? globalThis : this, () => {
+  const CHAT_BLIND_TEXT = /^(?:메시지가\s*블라인드\s*처리되었습니다|클린봇이\s*부적절한\s*표현을\s*감지했습니다|블라인드\s*처리된\s*메시지입니다)[\s.!?…]*$/i;
+  const BLINDED_CHAT_STATUSES = new Set([
+    "BLIND",
+    "HIDDEN",
+    "RECLAIM",
+    "FILTERED",
+    "CBOTBLIND"
+  ]);
+  const VISIBLE_CHAT_STATUSES = new Set(["NORMAL", "CANCEL"]);
+
   function clamp(value, minimum, maximum) {
     return Math.min(maximum, Math.max(minimum, value));
   }
@@ -532,17 +542,105 @@
   }
 
   function colorAlpha(color) {
-    if (!color || color === "transparent") {
+    if (!color) {
+      return 1;
+    }
+    if (String(color).trim().toLowerCase() === "transparent") {
       return 0;
     }
 
     const rgba = String(color).match(/^rgba?\(([^)]+)\)$/i);
-    if (!rgba) {
-      return 1;
+    if (rgba) {
+      const parts = rgba[1].split(/[\s,/]+/).filter(Boolean);
+      if (parts.length < 4) {
+        return 1;
+      }
+      const token = parts[3];
+      const alpha = token.endsWith("%")
+        ? Number(token.slice(0, -1)) / 100
+        : Number(token);
+      return Number.isFinite(alpha) ? clamp(alpha, 0, 1) : 1;
     }
 
-    const parts = rgba[1].split(/[\s,/]+/).filter(Boolean);
-    return parts.length >= 4 ? clamp(Number(parts[3]), 0, 1) : 1;
+    const colorFunction = String(color).match(
+      /^color\([^/]+\/\s*([+-]?(?:\d+(?:\.\d*)?|\.\d+)%?)\s*\)$/i
+    );
+    if (!colorFunction) {
+      return 1;
+    }
+    const token = colorFunction[1];
+    const alpha = token.endsWith("%")
+      ? Number(token.slice(0, -1)) / 100
+      : Number(token);
+    return Number.isFinite(alpha) ? clamp(alpha, 0, 1) : 1;
+  }
+
+  function shouldRestoreTransparentNickname(style) {
+    if (!style || colorAlpha(style.color) > 0.05) {
+      return false;
+    }
+    const hasPaintedBackground = String(style.backgroundImage || "")
+      .split(",")
+      .some((layer) => {
+        const background = layer.trim().toLowerCase();
+        return background && background !== "none";
+      });
+    const clipsBackgroundToText = [
+      style.backgroundClip,
+      style.webkitBackgroundClip
+    ].some((value) =>
+      String(value || "")
+        .split(",")
+        .some((clip) => clip.trim().toLowerCase() === "text")
+    );
+    return !(
+      hasPaintedBackground && clipsBackgroundToText
+    );
+  }
+
+  function chatMessageStatus(message) {
+    for (const value of [
+      message?.status,
+      message?.messageStatusType,
+      message?.msgStatusType
+    ]) {
+      if (value === undefined || value === null) {
+        continue;
+      }
+      const status = String(value).trim().toUpperCase();
+      if (status) {
+        return status;
+      }
+    }
+    return "";
+  }
+
+  function isBlindChatPlaceholder(text) {
+    return CHAT_BLIND_TEXT.test(String(text || ""));
+  }
+
+  function chatMessageBlindState(message, renderedText = "") {
+    const status = chatMessageStatus(message);
+    if (BLINDED_CHAT_STATUSES.has(status)) {
+      return "blinded";
+    }
+    if (VISIBLE_CHAT_STATUSES.has(status)) {
+      return "visible";
+    }
+    return isBlindChatPlaceholder(renderedText) ? "blinded" : "unknown";
+  }
+
+  function chatTextAfterRestoreCleanup(
+    currentText,
+    restoredText,
+    placeholder,
+    restorePlaceholder = true
+  ) {
+    return restorePlaceholder &&
+      placeholder !== undefined &&
+      currentText === restoredText
+      ? placeholder
+      : currentText;
   }
 
   function findContainedChatMessage(value, depth = 0, seen = new Set()) {
@@ -571,10 +669,34 @@
       return null;
     }
 
-    for (const key of ["memoizedProps", "pendingProps", "child", "children", "props"]) {
+    for (const key of [
+      "pendingProps",
+      "memoizedProps",
+      "props",
+      "children",
+      "child"
+    ]) {
       const found = findContainedChatMessage(value[key], depth + 1, seen);
       if (found) {
         return found;
+      }
+    }
+    return null;
+  }
+
+  function findChatMessageInReactElements(elements) {
+    const candidates = Array.from(elements || []);
+    for (const prefix of ["__reactProps$", "__reactFiber$"]) {
+      for (const candidate of candidates) {
+        for (const key of Object.keys(candidate || {})) {
+          if (!key.startsWith(prefix)) {
+            continue;
+          }
+          const message = findContainedChatMessage(candidate[key]);
+          if (message) {
+            return message;
+          }
+        }
       }
     }
     return null;
@@ -587,8 +709,12 @@
     clamp,
     compressorMakeupTrimDb,
     compressorThresholdForMediaVolume,
+    chatMessageBlindState,
+    chatMessageStatus,
+    chatTextAfterRestoreCleanup,
     colorAlpha,
     energyFromLoudnessDb,
+    findChatMessageInReactElements,
     findContainedChatMessage,
     formatDuration,
     formatVolumePercent,
@@ -598,6 +724,7 @@
     hasUsableNativeTimeline,
     hybridNormalizationGainDb,
     initialLiveSeekTarget,
+    isBlindChatPlaceholder,
     isAtLiveEdge,
     isSidebarPreviewTarget,
     loudnessDbFromEnergy,
@@ -613,6 +740,7 @@
     projectLiveEdge,
     timelineProgress,
     sourceLevelBeforeMediaVolume,
+    shouldRestoreTransparentNickname,
     shouldResetLoudnessMeasurement,
     stepAdaptiveGainDb,
     timedSampleValues,

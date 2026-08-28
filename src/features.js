@@ -33,7 +33,6 @@
     `#mid${EVENT_TITLE_TOKEN}VideoContainer`,
     `#mid${EVENT_TITLE_TOKEN}PlayerWrapper`
   ].join(", ");
-  const CHAT_BLIND_TEXT = /(?:메시지가\s*블라인드|클린봇이\s*부적절|블라인드\s*처리)/i;
   const POWER_READY_TEXT =
     /(?:통나무\s*파워.*(?:배달\s*완료|받기|수령)|(?:배달\s*완료|받기|수령).*통나무\s*파워)/i;
   const POWER_ACTION_TEXT = /^(?:배달\s*완료|받기|수령)$/i;
@@ -1958,27 +1957,9 @@
     }
   };
 
-  function reactValues(element) {
-    const values = [];
-    for (const key of Object.keys(element || {})) {
-      if (key.startsWith("__reactProps$") || key.startsWith("__reactFiber$")) {
-        values.push(element[key]);
-      }
-    }
-    return values;
-  }
-
   function chatMessageForItem(item) {
     const candidates = [item, ...Array.from(item.querySelectorAll("button, p, span, div")).slice(0, 40)];
-    for (const candidate of candidates) {
-      for (const value of reactValues(candidate)) {
-        const message = core.findContainedChatMessage(value);
-        if (message) {
-          return message;
-        }
-      }
-    }
-    return null;
+    return core.findChatMessageInReactElements(candidates);
   }
 
   function contentText(content) {
@@ -2006,9 +1987,19 @@
 
   const chatEnhancements = {
     originals: new Map(),
+    restoredNicknameStates: new WeakMap(),
+    hasRestoredMessages: false,
     observer: null,
     scanTimer: null,
     route: "",
+
+    enabled() {
+      return Boolean(
+        settings.chatTimestamp ||
+        settings.restoreTransparentNicknames ||
+        settings.restoreBlindedMessages
+      );
+    },
 
     ensureRoute() {
       const route = channelIdFromLocation();
@@ -2017,6 +2008,7 @@
       }
       this.route = route;
       this.originals.clear();
+      this.restoredNicknameStates = new WeakMap();
     },
 
     itemForElement(element, chatLog) {
@@ -2049,7 +2041,7 @@
     },
 
     remember(key, text) {
-      if (!key || !text || CHAT_BLIND_TEXT.test(text)) {
+      if (!key || !text || core.isBlindChatPlaceholder(text)) {
         return;
       }
       this.originals.set(key, text);
@@ -2058,21 +2050,67 @@
       }
     },
 
-    restoreNickname(item, message) {
+    clearRestoredNickname(target) {
+      target.classList.remove("cng-restored-nickname");
+      this.restoredNicknameStates.delete(target);
+    },
+
+    nicknameStyleSignature(target) {
+      const parts = [];
+      let current = target;
+      for (let depth = 0; current && depth < 4; depth += 1) {
+        const className = Array.from(current.classList || [])
+          .filter((name) => name !== "cng-restored-nickname")
+          .sort()
+          .join(".");
+        parts.push(`${className}|${current.getAttribute?.("style") || ""}`);
+        current = current.parentElement;
+      }
+      return parts.join(">");
+    },
+
+    restoreNickname(item, message, key) {
       const nickname = message?.profile?.nickname || "";
       const candidates = Array.from(
-        item.querySelectorAll("button, [class*='nickname'], [class*='username']")
+        item.querySelectorAll(
+          nickname
+            ? "button, [class*='nickname'], [class*='username']"
+            : "[class*='nickname'], [class*='username']"
+        )
       ).slice(0, 20);
       for (const candidate of candidates) {
-        candidate.classList.remove("cng-restored-nickname");
-        if (!settings.restoreTransparentNicknames) {
+        const hasRestoredClass = candidate.classList.contains(
+          "cng-restored-nickname"
+        );
+        const restoredState = this.restoredNicknameStates.get(candidate);
+        const styleSignature = this.nicknameStyleSignature(candidate);
+        const matchesNickname =
+          !nickname || (candidate.textContent || "").includes(nickname);
+
+        if (!settings.restoreTransparentNicknames || !matchesNickname) {
+          if (hasRestoredClass || restoredState !== undefined) {
+            this.clearRestoredNickname(candidate);
+          }
           continue;
         }
-        if (nickname && !(candidate.textContent || "").includes(nickname)) {
+
+        if (
+          hasRestoredClass &&
+          restoredState?.key === key &&
+          restoredState.styleSignature === styleSignature
+        ) {
           continue;
         }
-        if (core.colorAlpha(getComputedStyle(candidate).color) <= 0.05) {
+
+        if (hasRestoredClass || restoredState !== undefined) {
+          this.clearRestoredNickname(candidate);
+        }
+        if (core.shouldRestoreTransparentNickname(getComputedStyle(candidate))) {
           candidate.classList.add("cng-restored-nickname");
+          this.restoredNicknameStates.set(candidate, {
+            key,
+            styleSignature: this.nicknameStyleSignature(candidate)
+          });
         }
       }
     },
@@ -2080,12 +2118,14 @@
     clearRestoredMessage(target, { restorePlaceholder = true } = {}) {
       const placeholder = target.dataset.cngBlindPlaceholder;
       const restoredText = target.dataset.cngRestoredText;
-      if (
-        restorePlaceholder &&
-        placeholder !== undefined &&
-        target.textContent === restoredText
-      ) {
-        target.textContent = placeholder;
+      const cleanedText = core.chatTextAfterRestoreCleanup(
+        target.textContent,
+        restoredText,
+        placeholder,
+        restorePlaceholder
+      );
+      if (target.textContent !== cleanedText) {
+        target.textContent = cleanedText;
       }
       delete target.dataset.cngBlindedRestored;
       delete target.dataset.cngBlindPlaceholder;
@@ -2093,15 +2133,31 @@
       target.classList.remove("cng-restored-message");
     },
 
-    cleanItemState(item, key) {
+    cleanItemState(item, key, blindState, visibleText) {
       for (const target of item.querySelectorAll("[data-cng-blinded-restored]")) {
-        if (target.dataset.cngBlindedRestored !== key) {
+        const restoredKey = target.dataset.cngBlindedRestored;
+        if (restoredKey !== key) {
+          if (
+            blindState === "visible" &&
+            visibleText &&
+            target.textContent === target.dataset.cngRestoredText
+          ) {
+            target.textContent = visibleText;
+            this.clearRestoredMessage(target, { restorePlaceholder: false });
+          } else {
+            this.clearRestoredMessage(target);
+          }
+        } else if (blindState === "visible") {
           this.clearRestoredMessage(target, { restorePlaceholder: false });
         }
       }
-      if (!settings.restoreTransparentNicknames) {
-        for (const target of item.querySelectorAll(".cng-restored-nickname")) {
-          target.classList.remove("cng-restored-nickname");
+
+      for (const target of item.querySelectorAll(".cng-restored-nickname")) {
+        if (
+          !settings.restoreTransparentNicknames ||
+          this.restoredNicknameStates.get(target)?.key !== key
+        ) {
+          this.clearRestoredNickname(target);
         }
       }
       if (!settings.restoreBlindedMessages) {
@@ -2112,47 +2168,112 @@
     },
 
     cleanupDisabledFeatures() {
+      if (!settings.chatTimestamp) {
+        for (const target of document.querySelectorAll(".cng-chat-timestamp")) {
+          target.remove();
+        }
+      }
       if (!settings.restoreTransparentNicknames) {
         for (const target of document.querySelectorAll(".cng-restored-nickname")) {
-          target.classList.remove("cng-restored-nickname");
+          this.clearRestoredNickname(target);
         }
       }
       if (!settings.restoreBlindedMessages) {
         for (const target of document.querySelectorAll("[data-cng-blinded-restored]")) {
           this.clearRestoredMessage(target);
         }
+        this.hasRestoredMessages = false;
       }
     },
 
-    restoreBlinded(item, message, key) {
-      if (!settings.restoreBlindedMessages || !CHAT_BLIND_TEXT.test(item.textContent || "")) {
+    blindNoticeTarget(item) {
+      return (
+        Array.from(item.querySelectorAll("p, span, div"))
+          .filter((element) =>
+            core.isBlindChatPlaceholder(element.textContent)
+          )
+          .sort(
+            (left, right) =>
+              (left.textContent || "").length -
+              (right.textContent || "").length
+          )[0] || null
+      );
+    },
+
+    hasNativeHiddenChatStyle(item) {
+      const className = typeof item.className === "string" ? item.className : "";
+      return (
+        /(?:^|\s)[^\s]*_is_hidden_[^\s]*(?:\s|$)/i.test(
+          className
+        ) ||
+        Boolean(item.querySelector("[class*='_is_hidden_']"))
+      );
+    },
+
+    blindStateForItem(item, message) {
+      const officialState = core.chatMessageBlindState(message, "");
+      if (officialState === "visible") {
+        return "visible";
+      }
+      if (this.blindNoticeTarget(item)) {
+        return "blinded";
+      }
+      const restoredTarget = item.querySelector(
+        "[data-cng-blinded-restored]"
+      );
+      if (restoredTarget && this.hasNativeHiddenChatStyle(item)) {
+        return "blinded";
+      }
+      if (restoredTarget && officialState === "blinded") {
+        return "visible";
+      }
+      return "unknown";
+    },
+
+    restoreBlinded(item, message, key, blindState) {
+      if (!settings.restoreBlindedMessages || blindState !== "blinded") {
         return;
       }
       const directOriginal = contentText(message.originalContent);
-      const original =
-        directOriginal && !CHAT_BLIND_TEXT.test(directOriginal)
-          ? directOriginal
-          : this.originals.get(key);
+      const original = directOriginal || this.originals.get(key);
       if (!original) {
         return;
       }
 
-      const candidates = Array.from(item.querySelectorAll("p, span, div"))
-        .filter((element) => CHAT_BLIND_TEXT.test(element.textContent || ""))
-        .sort((left, right) =>
-          (left.textContent || "").length - (right.textContent || "").length
-      );
-      const target = candidates[0];
+      const restoredTarget = Array.from(
+        item.querySelectorAll("[data-cng-blinded-restored]")
+      ).find((element) => element.dataset.cngBlindedRestored === key);
+      if (restoredTarget?.textContent === original) {
+        if (!restoredTarget.classList.contains("cng-restored-message")) {
+          restoredTarget.classList.add("cng-restored-message");
+        }
+        this.hasRestoredMessages = true;
+        return;
+      }
+
+      const target = restoredTarget || this.blindNoticeTarget(item);
       if (!target) {
         return;
       }
-      if (target.dataset.cngBlindedRestored !== key) {
+      if (
+        core.isBlindChatPlaceholder(original) &&
+        target.textContent === original
+      ) {
+        return;
+      }
+      if (
+        target.dataset.cngBlindedRestored !== key ||
+        target.textContent !== target.dataset.cngRestoredText
+      ) {
         target.dataset.cngBlindPlaceholder = target.textContent || "";
       }
-      target.textContent = original;
+      if (target.textContent !== original) {
+        target.textContent = original;
+      }
       target.dataset.cngBlindedRestored = key;
       target.dataset.cngRestoredText = original;
       target.classList.add("cng-restored-message");
+      this.hasRestoredMessages = true;
     },
 
     addTimestamp(item, message, key) {
@@ -2173,8 +2294,22 @@
         const host = nickname?.parentElement || item;
         host.insertBefore(stamp, nickname || host.firstChild);
       }
-      stamp.textContent = timestamp;
-      stamp.dataset.messageKey = key;
+      if (stamp.textContent !== timestamp) {
+        stamp.textContent = timestamp;
+      }
+      if (stamp.dataset.messageKey !== key) {
+        stamp.dataset.messageKey = key;
+      }
+    },
+
+    clearItemState(item) {
+      item.querySelector(".cng-chat-timestamp")?.remove();
+      for (const target of item.querySelectorAll(".cng-restored-nickname")) {
+        this.clearRestoredNickname(target);
+      }
+      for (const target of item.querySelectorAll("[data-cng-blinded-restored]")) {
+        this.clearRestoredMessage(target);
+      }
     },
 
     processItem(item) {
@@ -2183,19 +2318,58 @@
       }
       const message = chatMessageForItem(item);
       if (!message?.time) {
+        this.clearItemState(item);
         return;
       }
       const key = String(message.key || `${message.user || "chat"}-${message.time}`);
-      this.cleanItemState(item, key);
+      const blindState = this.blindStateForItem(item, message);
       const original =
         contentText(message.originalContent) || contentText(message.content);
-      this.remember(key, original);
+      this.cleanItemState(item, key, blindState, original);
+      if (settings.restoreBlindedMessages) {
+        this.remember(key, original);
+      }
       this.addTimestamp(item, message, key);
-      this.restoreNickname(item, message);
-      this.restoreBlinded(item, message, key);
+      this.restoreNickname(item, message, key);
+      this.restoreBlinded(item, message, key, blindState);
+    },
+
+    verifyRestoredMessages() {
+      if (!settings.restoreBlindedMessages || !this.hasRestoredMessages) {
+        return;
+      }
+      const targets = Array.from(
+        document.querySelectorAll("[data-cng-blinded-restored]")
+      );
+      this.hasRestoredMessages = targets.length > 0;
+      for (const target of targets) {
+        const chatLog = target.closest?.("[role='log']");
+        const item = chatLog ? this.itemForElement(target, chatLog) : null;
+        if (!item) {
+          continue;
+        }
+        const message = chatMessageForItem(item);
+        if (!message?.time) {
+          this.clearItemState(item);
+          continue;
+        }
+        const key = String(
+          message.key || `${message.user || "chat"}-${message.time}`
+        );
+        const blindState = this.blindStateForItem(item, message);
+        if (
+          target.dataset.cngBlindedRestored !== key ||
+          blindState === "visible"
+        ) {
+          this.processItem(item);
+        }
+      }
     },
 
     scan(root = document) {
+      if (!this.enabled()) {
+        return;
+      }
       this.ensureRoute();
       const logs = root.matches?.("[role='log']")
         ? [root]
@@ -2209,6 +2383,10 @@
 
     scheduleScan() {
       clearTimeout(this.scanTimer);
+      this.scanTimer = null;
+      if (!this.enabled()) {
+        return;
+      }
       this.scanTimer = setTimeout(() => {
         this.scanTimer = null;
         this.scan();
@@ -2221,23 +2399,59 @@
           return;
         }
         this.observer = new MutationObserver((mutations) => {
-          let hasAddedElement = false;
+          if (!this.enabled()) {
+            return;
+          }
+          let affectsChat = false;
           for (const mutation of mutations) {
+            const mutationElement =
+              mutation.target instanceof HTMLElement
+                ? mutation.target
+                : mutation.target.parentElement;
+            if (
+              mutationElement?.closest?.("[role='log']") &&
+              (mutation.type === "characterData" ||
+                mutation.type === "attributes" ||
+                mutation.addedNodes.length > 0 ||
+                mutation.removedNodes.length > 0)
+            ) {
+              affectsChat = true;
+              break;
+            }
             for (const node of mutation.addedNodes) {
-              if (node instanceof HTMLElement) {
-                hasAddedElement = true;
+              const element =
+                node instanceof HTMLElement ? node : node.parentElement;
+              if (
+                element?.closest?.("[role='log']") ||
+                element?.matches?.("[role='log']") ||
+                element?.querySelector?.("[role='log']")
+              ) {
+                affectsChat = true;
                 break;
               }
             }
-            if (hasAddedElement) {
+            if (affectsChat) {
               break;
             }
           }
-          if (hasAddedElement) {
+          if (affectsChat) {
             this.scheduleScan();
           }
         });
-        this.observer.observe(document.body, { childList: true, subtree: true });
+        this.observer.observe(document.body, {
+          childList: true,
+          subtree: true,
+          characterData: true,
+          attributes: true,
+          attributeFilter: [
+            "class",
+            "style",
+            "data-index",
+            "data-key",
+            "data-virtual-index",
+            "aria-posinset"
+          ]
+        });
         this.scan();
       };
       observe();
@@ -2245,6 +2459,7 @@
         document.addEventListener("DOMContentLoaded", observe, { once: true });
       }
       setInterval(() => this.scan(), 3000);
+      setInterval(() => this.verifyRestoredMessages(), 100);
     }
   };
 

@@ -242,18 +242,35 @@
 }
 
 .cng-restored-nickname {
-  color: var(--Content-Neutral-Cool-Stronger, #dfe6e4) !important;
+  color: var(
+    --sem-color-content-neutral-cool-stronger,
+    var(--Content-Neutral-Cool-Stronger, CanvasText)
+  ) !important;
+  -webkit-text-fill-color: var(
+    --sem-color-content-neutral-cool-stronger,
+    var(--Content-Neutral-Cool-Stronger, CanvasText)
+  ) !important;
   opacity: 1 !important;
 }
 
-.cng-restored-message {
-  color: var(--Content-Neutral-Cool-Stronger, #dfe6e4) !important;
+[role="log"]
+  [data-cng-blinded-restored][data-cng-blind-placeholder][data-cng-restored-text].cng-restored-message {
+  color: var(
+    --sem-color-content-neutral-cool-stronger,
+    var(--Content-Neutral-Cool-Stronger, CanvasText)
+  ) !important;
+  -webkit-text-fill-color: var(
+    --sem-color-content-neutral-cool-stronger,
+    var(--Content-Neutral-Cool-Stronger, CanvasText)
+  ) !important;
   font-style: normal !important;
+  opacity: 1 !important;
 }
 
 .cng-restored-message::before {
   content: "[원문] ";
   color: #e2a84c;
+  -webkit-text-fill-color: #e2a84c;
   font-size: 0.85em;
   font-weight: 700;
 }

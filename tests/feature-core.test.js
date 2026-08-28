@@ -398,7 +398,151 @@ test("detects transparent computed colors", () => {
   assert.equal(core.colorAlpha("transparent"), 0);
   assert.equal(core.colorAlpha("rgba(20, 21, 23, 0)"), 0);
   assert.equal(core.colorAlpha("rgba(20, 21, 23, 0.5)"), 0.5);
+  assert.equal(core.colorAlpha("rgb(20 21 23 / 5%)"), 0.05);
+  assert.equal(core.colorAlpha("color(srgb 1 1 1 / 0)"), 0);
   assert.equal(core.colorAlpha("rgb(20, 21, 23)"), 1);
+  assert.equal(core.colorAlpha(""), 1);
+  assert.equal(core.colorAlpha("rgba(20, 21, 23, invalid)"), 1);
+});
+
+test("restores genuinely transparent nicknames without overriding gradients", () => {
+  assert.equal(
+    core.shouldRestoreTransparentNickname({
+      color: "rgba(255, 255, 255, 0)",
+      backgroundImage: "none",
+      backgroundClip: "border-box"
+    }),
+    true
+  );
+  assert.equal(
+    core.shouldRestoreTransparentNickname({
+      color: "rgba(255, 255, 255, 0.05)",
+      backgroundImage: "none"
+    }),
+    true
+  );
+  assert.equal(
+    core.shouldRestoreTransparentNickname({
+      color: "rgba(255, 255, 255, 0.06)",
+      backgroundImage: "none"
+    }),
+    false
+  );
+  assert.equal(
+    core.shouldRestoreTransparentNickname({
+      color: "transparent",
+      backgroundImage: "linear-gradient(red, blue)",
+      backgroundClip: "text"
+    }),
+    false
+  );
+  assert.equal(
+    core.shouldRestoreTransparentNickname({
+      color: "transparent",
+      backgroundImage: "linear-gradient(red, blue)",
+      backgroundClip: "border-box",
+      webkitBackgroundClip: "text"
+    }),
+    false
+  );
+  assert.equal(
+    core.shouldRestoreTransparentNickname({
+      color: "transparent",
+      backgroundImage: "linear-gradient(red, blue)",
+      backgroundClip: "border-box"
+    }),
+    true
+  );
+  assert.equal(
+    core.shouldRestoreTransparentNickname({
+      color: "transparent",
+      backgroundImage: "none",
+      backgroundClip: "text"
+    }),
+    true
+  );
+  assert.equal(
+    core.shouldRestoreTransparentNickname({
+      color: "rgb(20, 21, 23)",
+      backgroundImage: "none"
+    }),
+    false
+  );
+});
+
+test("uses official chat status before exact blind-notice fallback", () => {
+  for (const status of [
+    "BLIND",
+    "HIDDEN",
+    "RECLAIM",
+    "FILTERED",
+    "CBOTBLIND"
+  ]) {
+    assert.equal(core.chatMessageBlindState({ status }, "ordinary text"), "blinded");
+  }
+  assert.equal(
+    core.chatMessageBlindState(
+      { status: "NORMAL" },
+      "메시지가 블라인드 처리되었습니다."
+    ),
+    "visible"
+  );
+  assert.equal(
+    core.chatMessageBlindState(
+      { status: "CANCEL" },
+      "메시지가 블라인드 처리되었습니다."
+    ),
+    "visible"
+  );
+  assert.equal(
+    core.chatMessageBlindState(
+      { messageStatusType: "CBOTBLIND" },
+      "ordinary text"
+    ),
+    "blinded"
+  );
+  assert.equal(
+    core.chatMessageBlindState({}, "메시지가 블라인드 처리되었습니다."),
+    "blinded"
+  );
+  assert.equal(
+    core.chatMessageBlindState({}, "클린봇이 부적절한 표현을 감지했습니다"),
+    "blinded"
+  );
+  assert.equal(
+    core.chatMessageBlindState({}, "방금 '메시지가 블라인드 처리되었습니다'라고 떴다"),
+    "unknown"
+  );
+  assert.equal(core.chatMessageBlindState({}, "블라인드 처리 테스트 중"), "unknown");
+  assert.equal(core.chatMessageBlindState({}, "ordinary text"), "unknown");
+});
+
+test("restores a native placeholder only while stale restored text is still present", () => {
+  assert.equal(
+    core.chatTextAfterRestoreCleanup(
+      "first original",
+      "first original",
+      "메시지가 블라인드 처리되었습니다."
+    ),
+    "메시지가 블라인드 처리되었습니다."
+  );
+  assert.equal(
+    core.chatTextAfterRestoreCleanup(
+      "second native text",
+      "first original",
+      "메시지가 블라인드 처리되었습니다."
+    ),
+    "second native text"
+  );
+  assert.equal(
+    core.chatTextAfterRestoreCleanup(
+      "first original",
+      "first original",
+      "메시지가 블라인드 처리되었습니다.",
+      false
+    ),
+    "first original"
+  );
 });
 
 test("chat lookup stays inside the current React item", () => {
@@ -422,5 +566,35 @@ test("chat lookup stays inside the current React item", () => {
   assert.equal(
     core.findContainedChatMessage({ sibling: { pendingProps: { chatMessage: adjacent } } }),
     null
+  );
+});
+
+test("chat lookup prefers current React props and pending fiber props", () => {
+  const stale = {
+    time: 1000,
+    content: "stale",
+    originalContent: "stale"
+  };
+  const current = {
+    time: 2000,
+    content: "current",
+    originalContent: "current"
+  };
+  const parent = {
+    "__reactFiber$test": {
+      memoizedProps: { chatMessage: stale }
+    }
+  };
+  const child = {
+    "__reactProps$test": { chatMessage: current }
+  };
+
+  assert.equal(core.findChatMessageInReactElements([parent, child]), current);
+  assert.equal(
+    core.findContainedChatMessage({
+      memoizedProps: { chatMessage: stale },
+      pendingProps: { chatMessage: current }
+    }),
+    current
   );
 });
