@@ -132,6 +132,30 @@
       : null;
   }
 
+  function bufferedAhead(ranges, currentTime, toleranceSeconds = 0.05) {
+    const position = Number(currentTime);
+    const tolerance = Math.max(0, Number(toleranceSeconds) || 0);
+    if (!ranges?.length || !Number.isFinite(position)) {
+      return 0;
+    }
+
+    let ahead = 0;
+    for (let index = 0; index < ranges.length; index += 1) {
+      const start = Number(ranges.start(index));
+      const end = Number(ranges.end(index));
+      if (
+        Number.isFinite(start) &&
+        Number.isFinite(end) &&
+        end >= start &&
+        position >= start - tolerance &&
+        position <= end + tolerance
+      ) {
+        ahead = Math.max(ahead, end - position);
+      }
+    }
+    return Math.max(0, ahead);
+  }
+
   function hasUsableNativeTimeline(candidates) {
     return (Array.isArray(candidates) ? candidates : []).some(
       ({ custom, display, visibility, width, height }) =>
@@ -706,6 +730,7 @@
     adaptiveLoudnessStats,
     appendTimedSample,
     biquadQDbFromLinear,
+    bufferedAhead,
     clamp,
     compressorMakeupTrimDb,
     compressorThresholdForMediaVolume,

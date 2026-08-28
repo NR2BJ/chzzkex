@@ -74,6 +74,24 @@ test("seeks a newly started live video close to the current seekable edge", () =
   assert.equal(core.initialLiveSeekTarget(10, 10, 10), null);
 });
 
+test("measures buffered playback only in the range containing the playhead", () => {
+  const ranges = {
+    length: 2,
+    start(index) {
+      return [0, 70][index];
+    },
+    end(index) {
+      return [62, 90][index];
+    }
+  };
+
+  assert.equal(core.bufferedAhead(ranges, 60), 2);
+  assert.equal(core.bufferedAhead(ranges, 65), 0);
+  assert.equal(core.bufferedAhead(ranges, 70), 20);
+  assert.equal(core.bufferedAhead(null, 60), 0);
+  assert.equal(core.bufferedAhead(ranges, Number.NaN), 0);
+});
+
 test("recognizes only a genuinely visible native timeline", () => {
   assert.equal(
     core.hasUsableNativeTimeline([

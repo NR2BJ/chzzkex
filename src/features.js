@@ -33,6 +33,13 @@
     `#mid${EVENT_TITLE_TOKEN}VideoContainer`,
     `#mid${EVENT_TITLE_TOKEN}PlayerWrapper`
   ].join(", ");
+  const NATIVE_TIMELINE_SELECTOR = [
+    ".pzp-pc-progress-slider[role='slider']",
+    ".pzp-pc__progress-slider[role='slider']",
+    ".pzp-progress-slider[role='slider']",
+    "[class*='progress-slider'][role='slider']",
+    "[data-role*='progress'][role='slider']"
+  ].join(", ");
   const POWER_READY_TEXT =
     /(?:통나무\s*파워.*(?:배달\s*완료|받기|수령)|(?:배달\s*완료|받기|수령).*통나무\s*파워)/i;
   const POWER_ACTION_TEXT = /^(?:배달\s*완료|받기|수령)$/i;
@@ -127,10 +134,6 @@
     return video;
   }
 
-  function lastRangeEnd(ranges) {
-    return ranges?.length ? ranges.end(ranges.length - 1) : null;
-  }
-
   function seekableWindow(video) {
     if (!video?.seekable?.length) {
       return null;
@@ -146,6 +149,20 @@
 
   function customTimelineSlider(element) {
     return element?.closest?.(".cng-timeline-assist[role='slider']") || null;
+  }
+
+  function nativeTimelineSlider(element) {
+    const slider = element?.closest?.(NATIVE_TIMELINE_SELECTOR) || null;
+    if (
+      !slider ||
+      slider.classList.contains("cng-timeline-assist") ||
+      slider.closest("[class*='volume'], [data-role*='volume']")
+    ) {
+      return null;
+    }
+    return slider.closest(".pzp-pc, .pzp, [class*='video_player']")
+      ? slider
+      : null;
   }
 
   const timelineAssist = {
@@ -169,7 +186,9 @@
       this.liveAnchorAt = performance.now();
       this.lastObservedEnd = range.end;
       this.displayDuration = range.duration;
-      playbackState.manualTimelinePosition = false;
+      if (!playbackState.hasSeekIntentForRoute(location.pathname)) {
+        playbackState.clearManualSeekIntent();
+      }
     },
 
     liveEdge(video, range) {
@@ -197,6 +216,10 @@
     remove() {
       this.element?.remove();
       this.element = null;
+      this.cancelDrag();
+    },
+
+    cancelDrag() {
       this.activePointerId = null;
       this.slider = null;
     },
@@ -242,15 +265,7 @@
       }
 
       const candidates = Array.from(
-        player.querySelectorAll(
-          [
-            ".pzp-pc-progress-slider[role='slider']",
-            ".pzp-pc__progress-slider[role='slider']",
-            ".pzp-progress-slider[role='slider']",
-            "[class*='progress-slider'][role='slider']",
-            "[data-role*='progress'][role='slider']"
-          ].join(", ")
-        )
+        player.querySelectorAll(NATIVE_TIMELINE_SELECTOR)
       ).map((element) => {
         const style = getComputedStyle(element);
         const bounds = element.getBoundingClientRect();
@@ -262,16 +277,18 @@
           height: bounds.height
         };
       });
-      if (core.hasUsableNativeTimeline(candidates)) {
-        this.nativeTimelineAvailable = true;
-      }
+      this.nativeTimelineAvailable = core.hasUsableNativeTimeline(candidates);
       return this.nativeTimelineAvailable;
     },
 
     tick() {
+      if (!settings.timelineAssist || !isLiveRoute()) {
+        this.remove();
+        return;
+      }
       const video = mainVideo();
       const range = seekableWindow(video);
-      if (!settings.timelineAssist || !isLiveRoute() || !video || !range || range.duration > 300) {
+      if (!video || !range || range.duration > 300) {
         this.remove();
         return;
       }
@@ -342,8 +359,8 @@
         return false;
       }
 
+      playbackState.markManualSeekIntent(target < range.end - 2);
       video.currentTime = target;
-      playbackState.manualTimelinePosition = target < range.end - 2;
       return true;
     },
 
@@ -374,8 +391,9 @@
         return;
       }
 
-      video.currentTime = core.clamp(target, range.start, range.end - 0.25);
-      playbackState.manualTimelinePosition = video.currentTime < range.end - 2;
+      const nextTime = core.clamp(target, range.start, range.end - 0.25);
+      playbackState.markManualSeekIntent(nextTime < range.end - 2);
+      video.currentTime = nextTime;
       event.preventDefault();
       event.stopImmediatePropagation();
     },
@@ -403,6 +421,10 @@
       ) {
         return;
       }
+      if (!settings.timelineAssist) {
+        timelineAssist.cancelDrag();
+        return;
+      }
 
       timelineAssist.seek(event, timelineAssist.slider);
       event.preventDefault();
@@ -414,11 +436,19 @@
         return;
       }
 
-      if (timelineAssist.slider) {
+      if (settings.timelineAssist && timelineAssist.slider) {
         timelineAssist.seek(event, timelineAssist.slider);
       }
-      timelineAssist.activePointerId = null;
-      timelineAssist.slider = null;
+      timelineAssist.cancelDrag();
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    },
+
+    onPointerCancel(event) {
+      if (timelineAssist.activePointerId !== event.pointerId) {
+        return;
+      }
+      timelineAssist.cancelDrag();
       event.preventDefault();
       event.stopImmediatePropagation();
     },
@@ -427,7 +457,7 @@
       document.addEventListener("pointerdown", this.onPointerDown, true);
       document.addEventListener("pointermove", this.onPointerMove, true);
       document.addEventListener("pointerup", this.onPointerUp, true);
-      document.addEventListener("pointercancel", this.onPointerUp, true);
+      document.addEventListener("pointercancel", this.onPointerCancel, true);
       document.addEventListener("keydown", this.onKeyDown, true);
       setInterval(() => this.tick(), 250);
     }
@@ -435,8 +465,10 @@
 
   const playbackState = {
     manualTimelinePosition: false,
+    manualTimelineRoute: "",
     adapter: null,
     nextAdapterSearchAt: 0,
+    userSeekIntentUntil: 0,
 
     findCore(instance, depth = 0, seen = new Set()) {
       if (!instance || depth > 12 || seen.has(instance)) {
@@ -502,15 +534,99 @@
       return core.trackLatencyMode(this.selectedTrack());
     },
 
+    clearManualSeekIntent() {
+      this.manualTimelinePosition = false;
+      this.manualTimelineRoute = "";
+      this.userSeekIntentUntil = 0;
+    },
+
+    hasSeekIntentForRoute(route) {
+      return Boolean(route && this.manualTimelineRoute === route);
+    },
+
+    markManualSeekIntent(manualPosition = true) {
+      const route = isLiveRoute() ? location.pathname : "";
+      this.manualTimelinePosition = Boolean(manualPosition);
+      this.manualTimelineRoute = route;
+      this.userSeekIntentUntil = performance.now() + 2000;
+      initialLiveEdgeSync.cancel(route);
+    },
+
+    isPlayerSeekTarget(target) {
+      if (nativeTimelineSlider(target)) {
+        return true;
+      }
+      const video = mainVideo();
+      const player =
+        video?.closest(".pzp-pc, .pzp") ||
+        video?.closest("[class*='video_player']") ||
+        video?.parentElement;
+      return Boolean(
+        target &&
+        (target === document.body ||
+          target === video ||
+          player === target ||
+          player?.contains?.(target))
+      );
+    },
+
+    isSeekKey(key) {
+      return (
+        ["ArrowLeft", "ArrowRight", "Home", "End", "PageUp", "PageDown"].includes(
+          key
+        ) || /^[jl]$/i.test(String(key || ""))
+      );
+    },
+
+    onNativePointerDown(event) {
+      if (
+        event.isTrusted &&
+        event.button === 0 &&
+        nativeTimelineSlider(event.target)
+      ) {
+        playbackState.markManualSeekIntent();
+      }
+    },
+
+    onNativeKeyDown(event) {
+      if (
+        event.isTrusted &&
+        playbackState.isSeekKey(event.key) &&
+        playbackState.isPlayerSeekTarget(event.target)
+      ) {
+        playbackState.markManualSeekIntent();
+      }
+    },
+
+    onSeeking(event) {
+      const video = event.target;
+      if (initialLiveEdgeSync.consumeOwnSeek(video) || video !== mainVideo()) {
+        return;
+      }
+      if (
+        (playbackState.userSeekIntentUntil > 0 &&
+          performance.now() <= playbackState.userSeekIntentUntil) ||
+        initialLiveEdgeSync.hasObservedCandidate(video)
+      ) {
+        playbackState.markManualSeekIntent();
+      }
+    },
+
     onClick(event) {
       const button = event.target?.closest?.("button");
       if (button && /^(실시간|LIVE)$/i.test((button.textContent || "").trim())) {
-        playbackState.manualTimelinePosition = false;
+        playbackState.clearManualSeekIntent();
+        initialLiveEdgeSync.cancel(
+          isLiveRoute() ? location.pathname : ""
+        );
       }
     },
 
     start() {
       document.addEventListener("click", this.onClick, true);
+      document.addEventListener("pointerdown", this.onNativePointerDown, true);
+      document.addEventListener("keydown", this.onNativeKeyDown, true);
+      document.addEventListener("seeking", this.onSeeking, true);
     }
   };
 
@@ -521,14 +637,58 @@
     candidateSince: 0,
     decided: false,
     deadlineAt: 0,
+    cancelledRoute: "",
+    ownSeekVideo: null,
+    ownSeekExpiresAt: 0,
 
     reset(route, now) {
       this.route = route;
+      if (!playbackState.hasSeekIntentForRoute(route)) {
+        playbackState.clearManualSeekIntent();
+      }
       this.candidateVideo = null;
       this.candidateSource = "";
       this.candidateSince = 0;
-      this.decided = false;
+      this.decided = Boolean(route && this.cancelledRoute === route);
+      if (!this.decided) {
+        this.cancelledRoute = "";
+      }
       this.deadlineAt = route ? now + 15000 : 0;
+    },
+
+    cancel(route = isLiveRoute() ? location.pathname : "") {
+      if (!route) {
+        return;
+      }
+      this.cancelledRoute = route;
+      if (this.route === route) {
+        this.decided = true;
+      }
+    },
+
+    hasObservedCandidate(video) {
+      const routeChanged =
+        (isLiveRoute() ? location.pathname : "") !== this.route;
+      return Boolean(
+        video &&
+        video === this.candidateVideo &&
+        (!this.decided || routeChanged)
+      );
+    },
+
+    beginOwnSeek(video) {
+      this.ownSeekVideo = video;
+      this.ownSeekExpiresAt = performance.now() + 2000;
+    },
+
+    consumeOwnSeek(video) {
+      if (!video || video !== this.ownSeekVideo) {
+        return false;
+      }
+      const isCurrent = performance.now() <= this.ownSeekExpiresAt;
+      this.ownSeekVideo = null;
+      this.ownSeekExpiresAt = 0;
+      return isCurrent;
     },
 
     tick() {
@@ -537,7 +697,7 @@
       if (route !== this.route) {
         this.reset(route, now);
       }
-      if (!route || this.decided) {
+      if (!route || this.decided || !settings.timelineAssist) {
         return;
       }
       if (now > this.deadlineAt) {
@@ -586,8 +746,9 @@
       }
 
       const previousTime = video.currentTime;
+      this.beginOwnSeek(video);
+      playbackState.clearManualSeekIntent();
       video.currentTime = target;
-      playbackState.manualTimelinePosition = false;
       log("initial live edge synchronized", {
         previousTime,
         target,
@@ -1743,11 +1904,12 @@
         return;
       }
       event.stopPropagation();
+      clearTimeout(sidebarPreview.hideTimer);
+      sidebarPreview.hideTimer = null;
       if (link === sidebarPreview.currentLink) {
         return;
       }
       clearTimeout(sidebarPreview.timer);
-      clearTimeout(sidebarPreview.hideTimer);
       sidebarPreview.currentLink = link;
       sidebarPreview.route = location.href;
       sidebarPreview.suppressNativeTooltip(link);
@@ -1755,6 +1917,9 @@
     },
 
     onPointerOut(event) {
+      if (!settings.sidebarPreview) {
+        return;
+      }
       const link = sidebarPreview.liveLink(event.target);
       if (!link) {
         return;
@@ -1797,6 +1962,33 @@
       }
     },
 
+    connectObserver() {
+      if (this.observer || !settings.sidebarPreview) {
+        return;
+      }
+      this.observer = new MutationObserver(this.onPageStateChange);
+      this.observer.observe(document, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: ["href", "id"]
+      });
+    },
+
+    disconnectObserver() {
+      this.observer?.disconnect();
+      this.observer = null;
+    },
+
+    setEnabled(enabled) {
+      if (enabled) {
+        this.connectObserver();
+      } else {
+        this.hide();
+        this.disconnectObserver();
+      }
+    },
+
     start() {
       document.addEventListener("pointerover", this.onPointerOver, true);
       document.addEventListener("pointerout", this.onPointerOut, true);
@@ -1809,8 +2001,7 @@
       window.addEventListener("pagehide", this.onNavigationIntent);
       window.addEventListener("resize", this.onNavigationIntent);
       window.addEventListener("scroll", this.onNavigationIntent, true);
-      this.observer = new MutationObserver(this.onPageStateChange);
-      this.observer.observe(document, { childList: true, subtree: true });
+      this.setEnabled(settings.sidebarPreview);
     }
   };
 
@@ -1938,6 +2129,7 @@
       );
       const mode = playbackState.mode();
       const loudnessStatus = loudness.status();
+      const bufferAhead = core.bufferedAhead(video.buffered, video.currentTime);
       const element = this.ensureElement(anchor);
       const status = [];
       const details = [];
@@ -1945,7 +2137,12 @@
         status.push(mode ? `${mode} 자동` : "자동");
         status.push(`지연 ${liveDistance.toFixed(1)}초`);
         details.push(`지연: 현재 화면에서 실시간 위치까지 ${liveDistance.toFixed(1)}초`);
+      } else {
+        status.push(`LIVE까지 ${liveDistance.toFixed(1)}초`);
+        details.push(`LIVE까지 남은 시간: ${liveDistance.toFixed(1)}초`);
       }
+      status.push(`미리 받음 ${bufferAhead.toFixed(1)}초`);
+      details.push(`미리 받은 재생 분량: ${bufferAhead.toFixed(1)}초`);
       status.push(`음량 ${loudnessStatus}`);
       details.push(`음량 맞춤: ${loudnessStatus}`);
       element.textContent = status.join(" · ");
@@ -1991,6 +2188,9 @@
     hasRestoredMessages: false,
     observer: null,
     scanTimer: null,
+    scanInterval: null,
+    verifyInterval: null,
+    waitingForBody: false,
     route: "",
 
     enabled() {
@@ -2393,73 +2593,120 @@
       }, 50);
     },
 
-    start() {
-      const observe = () => {
-        if (!document.body || this.observer) {
-          return;
-        }
-        this.observer = new MutationObserver((mutations) => {
-          if (!this.enabled()) {
-            return;
-          }
-          let affectsChat = false;
-          for (const mutation of mutations) {
-            const mutationElement =
-              mutation.target instanceof HTMLElement
-                ? mutation.target
-                : mutation.target.parentElement;
-            if (
-              mutationElement?.closest?.("[role='log']") &&
-              (mutation.type === "characterData" ||
-                mutation.type === "attributes" ||
-                mutation.addedNodes.length > 0 ||
-                mutation.removedNodes.length > 0)
-            ) {
-              affectsChat = true;
-              break;
-            }
-            for (const node of mutation.addedNodes) {
-              const element =
-                node instanceof HTMLElement ? node : node.parentElement;
-              if (
-                element?.closest?.("[role='log']") ||
-                element?.matches?.("[role='log']") ||
-                element?.querySelector?.("[role='log']")
-              ) {
-                affectsChat = true;
-                break;
-              }
-            }
-            if (affectsChat) {
-              break;
-            }
-          }
-          if (affectsChat) {
-            this.scheduleScan();
-          }
-        });
-        this.observer.observe(document.body, {
-          childList: true,
-          subtree: true,
-          characterData: true,
-          attributes: true,
-          attributeFilter: [
-            "class",
-            "style",
-            "data-index",
-            "data-key",
-            "data-virtual-index",
-            "aria-posinset"
-          ]
-        });
-        this.scan();
-      };
-      observe();
-      if (!document.body) {
-        document.addEventListener("DOMContentLoaded", observe, { once: true });
+    onMutations(mutations) {
+      if (!this.enabled()) {
+        return;
       }
-      setInterval(() => this.scan(), 3000);
-      setInterval(() => this.verifyRestoredMessages(), 100);
+      let affectsChat = false;
+      for (const mutation of mutations) {
+        const mutationElement =
+          mutation.target instanceof HTMLElement
+            ? mutation.target
+            : mutation.target.parentElement;
+        if (
+          mutationElement?.closest?.("[role='log']") &&
+          (mutation.type === "characterData" ||
+            mutation.type === "attributes" ||
+            mutation.addedNodes.length > 0 ||
+            mutation.removedNodes.length > 0)
+        ) {
+          affectsChat = true;
+          break;
+        }
+        for (const node of mutation.addedNodes) {
+          const element =
+            node instanceof HTMLElement ? node : node.parentElement;
+          if (
+            element?.closest?.("[role='log']") ||
+            element?.matches?.("[role='log']") ||
+            element?.querySelector?.("[role='log']")
+          ) {
+            affectsChat = true;
+            break;
+          }
+        }
+        if (affectsChat) {
+          break;
+        }
+      }
+      if (affectsChat) {
+        this.scheduleScan();
+      }
+    },
+
+    connect() {
+      if (!this.enabled() || this.observer) {
+        return;
+      }
+      if (!document.body) {
+        if (!this.waitingForBody) {
+          this.waitingForBody = true;
+          document.addEventListener(
+            "DOMContentLoaded",
+            () => {
+              this.waitingForBody = false;
+              this.connect();
+            },
+            { once: true }
+          );
+        }
+        return;
+      }
+
+      this.observer = new MutationObserver((mutations) =>
+        this.onMutations(mutations)
+      );
+      this.observer.observe(document.body, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+        attributes: true,
+        attributeFilter: [
+          "class",
+          "style",
+          "data-index",
+          "data-key",
+          "data-virtual-index",
+          "aria-posinset",
+          "role"
+        ]
+      });
+      this.scanInterval = setInterval(() => this.scan(), 3000);
+      this.verifyInterval = setInterval(
+        () => this.verifyRestoredMessages(),
+        100
+      );
+      this.scan();
+    },
+
+    disconnect() {
+      clearTimeout(this.scanTimer);
+      this.scanTimer = null;
+      this.observer?.disconnect();
+      this.observer = null;
+      if (this.scanInterval !== null) {
+        clearInterval(this.scanInterval);
+        this.scanInterval = null;
+      }
+      if (this.verifyInterval !== null) {
+        clearInterval(this.verifyInterval);
+        this.verifyInterval = null;
+      }
+      this.originals.clear();
+      this.restoredNicknameStates = new WeakMap();
+      this.hasRestoredMessages = false;
+    },
+
+    setEnabled(enabled) {
+      if (enabled) {
+        this.connect();
+      } else {
+        this.disconnect();
+      }
+    },
+
+    start() {
+      this.setEnabled(this.enabled());
     }
   };
 
@@ -2533,10 +2780,12 @@
     ) {
       loudness.refreshNormalizationPlan();
     }
-    if (!settings.sidebarPreview) {
-      sidebarPreview.hide();
+    if (!settings.timelineAssist) {
+      timelineAssist.remove();
     }
+    sidebarPreview.setEnabled(Boolean(settings.sidebarPreview));
     chatEnhancements.cleanupDisabledFeatures();
+    chatEnhancements.setEnabled(chatEnhancements.enabled());
     chatEnhancements.scheduleScan();
     log("settings updated", settings);
   }

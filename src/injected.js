@@ -67,17 +67,25 @@
     "chzzk-ex-playback-rejection-hidden";
   const PLAYBACK_REJECTION_ACTIVE_CLASS =
     "chzzk-ex-playback-rejection-active";
+  const PLAYBACK_MUTATION_SELECTOR = [
+    "video",
+    AUXILIARY_VIDEO_CONTAINER_SELECTOR,
+    AUXILIARY_CONTEXT_SELECTOR,
+    PLAYBACK_REJECTION_LAYER_SELECTOR
+  ].join(", ");
   const AUXILIARY_CONTAINER_CLASS = "chzzk-ex-auxiliary";
   const AUXILIARY_MEDIA_HOST_PATTERN = /(^|\.)((tvetamovie\.pstatic\.net)|(glad-vod\.pstatic\.net)|(video-gfa\.pstatic\.net))$/i;
 
   let settings = { ...DEFAULT_SETTINGS };
   let playbackAdvanceListeners;
   let pendingPrimaryMuted;
+  let pendingPrimaryMuteRestore;
   let preferredPrimaryMuted;
   let lastUserVolumeIntentAt = Number.NEGATIVE_INFINITY;
-  const advancedAuxiliaryVideos = new WeakSet();
-  const pendingAuxiliaryVideos = new WeakSet();
+  const auxiliaryPlaybackStates = new WeakMap();
   const pendingPrimarySnapshots = new WeakSet();
+  let nextAuxiliaryPlaybackGeneration = 0;
+  let playbackInterruptionScanScheduled = false;
 
   function suppressPlaybackRejectionSignal() {
     if (globalThis[REJECTION_GUARD_RUNTIME]) {
@@ -738,7 +746,14 @@
   }
 
   function textOf(element) {
-    return `${element.getAttribute("aria-label") || ""} ${element.textContent || ""}`.trim();
+    return [
+      element.getAttribute("aria-label"),
+      element.getAttribute("title"),
+      element.textContent
+    ]
+      .filter(Boolean)
+      .join(" ")
+      .trim();
   }
 
   function isInterruptionSkipButton(button) {
@@ -783,6 +798,59 @@
         Boolean(video.currentSrc || video.src) &&
         (!video.paused || video.readyState > 0)
     );
+  }
+
+  function auxiliaryPlaybackSource(video) {
+    return [video?.currentSrc, video?.src]
+      .map((value) => String(value || ""))
+      .join("\n");
+  }
+
+  function invalidatePrimaryMuteRestoreBefore(generation) {
+    if (
+      pendingPrimaryMuteRestore &&
+      pendingPrimaryMuteRestore.generation < generation
+    ) {
+      pendingPrimaryMuteRestore = undefined;
+    }
+  }
+
+  function createAuxiliaryPlaybackState(
+    video,
+    { invalidatePreviousRestore = false } = {}
+  ) {
+    const state = {
+      source: auxiliaryPlaybackSource(video),
+      generation: ++nextAuxiliaryPlaybackGeneration,
+      pending: false,
+      advanced: false
+    };
+    auxiliaryPlaybackStates.set(video, state);
+    if (invalidatePreviousRestore) {
+      invalidatePrimaryMuteRestoreBefore(state.generation);
+    }
+    return state;
+  }
+
+  function auxiliaryPlaybackState(video) {
+    const source = auxiliaryPlaybackSource(video);
+    const state = auxiliaryPlaybackStates.get(video);
+    if (state && state.source === source) {
+      return state;
+    }
+
+    return createAuxiliaryPlaybackState(video, {
+      invalidatePreviousRestore: Boolean(video?.currentSrc || video?.src)
+    });
+  }
+
+  function resetAuxiliaryPlaybackState(
+    video,
+    { invalidatePreviousRestore = false } = {}
+  ) {
+    if (auxiliaryPlaybackStates.has(video) || isAuxiliaryVideo(video)) {
+      createAuxiliaryPlaybackState(video, { invalidatePreviousRestore });
+    }
   }
 
   function volumeControlText(node) {
@@ -894,11 +962,25 @@
     }
   }
 
+  function schedulePrimaryMuteRestore(video, generation) {
+    const request = { video, generation };
+    pendingPrimaryMuteRestore = request;
+    setTimeout(() => {
+      if (
+        pendingPrimaryMuteRestore?.video !== video ||
+        pendingPrimaryMuteRestore?.generation !== generation
+      ) {
+        return;
+      }
+
+      pendingPrimaryMuteRestore = undefined;
+      restoreCurrentPrimaryMute();
+    }, PRIMARY_MUTE_RESTORE_DELAY_MS);
+  }
+
   function advanceAuxiliaryPlayback(video) {
-    if (
-      advancedAuxiliaryVideos.has(video) ||
-      pendingAuxiliaryVideos.has(video)
-    ) {
+    const playback = auxiliaryPlaybackState(video);
+    if (playback.advanced || playback.pending) {
       return true;
     }
 
@@ -917,18 +999,39 @@
       return false;
     }
 
-    if (preferredPrimaryMuted !== undefined) {
-      pendingPrimaryMuted = preferredPrimaryMuted;
-    }
-    pendingAuxiliaryVideos.add(video);
+    playback.pending = true;
+    const generation = playback.generation;
     setTimeout(() => {
-      pendingAuxiliaryVideos.delete(video);
-      if (advancedAuxiliaryVideos.has(video)) {
+      const currentPlayback = auxiliaryPlaybackState(video);
+      if (currentPlayback.generation !== generation) {
         return;
       }
 
-      advancedAuxiliaryVideos.add(video);
-      for (const listener of listeners) {
+      currentPlayback.pending = false;
+      if (currentPlayback.advanced) {
+        return;
+      }
+
+      const currentListeners = Array.isArray(playbackAdvanceListeners)
+        ? playbackAdvanceListeners.filter(
+            (listener) => typeof listener === "function"
+          )
+        : [];
+      if (
+        video.isConnected === false ||
+        !isAuxiliaryVideo(video) ||
+        video.paused ||
+        video.readyState < 2 ||
+        currentListeners.length === 0
+      ) {
+        return;
+      }
+
+      currentPlayback.advanced = true;
+      if (preferredPrimaryMuted !== undefined) {
+        pendingPrimaryMuted = preferredPrimaryMuted;
+      }
+      for (const listener of currentListeners) {
         try {
           listener();
         } catch (error) {
@@ -936,7 +1039,7 @@
         }
       }
 
-      setTimeout(restoreCurrentPrimaryMute, PRIMARY_MUTE_RESTORE_DELAY_MS);
+      schedulePrimaryMuteRestore(video, currentPlayback.generation);
       log("advanced auxiliary playback");
     }, PLAYBACK_ADVANCE_DELAY_MS);
     return true;
@@ -990,19 +1093,194 @@
     }
 
     finishAuxiliaryVideos();
+  }
 
+  function elementMatchesOrContains(element, selector) {
+    if (!element || typeof element !== "object") {
+      return false;
+    }
+
+    try {
+      return Boolean(
+        element.matches?.(selector) ||
+        element.closest?.(selector) ||
+        element.querySelector?.(selector)
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  function playbackMutationNodeIsRelevant(node) {
+    const element = node?.nodeType === 3 ? node.parentElement : node;
+    if (!element || typeof element !== "object") {
+      return false;
+    }
+
+    if (elementMatchesOrContains(element, PLAYBACK_MUTATION_SELECTOR)) {
+      return true;
+    }
+
+    const buttons = [];
+    const closestButton = element.closest?.("button, [role='button']");
+    if (closestButton) {
+      buttons.push(closestButton);
+    }
+    if (element.matches?.("button, [role='button']")) {
+      buttons.push(element);
+    }
+    try {
+      for (const button of element.querySelectorAll?.(
+        "button, [role='button']"
+      ) || []) {
+        buttons.push(button);
+      }
+    } catch {
+      // Ignore nodes whose selector implementation is no longer usable.
+    }
+    return buttons.some(isInterruptionSkipButton);
+  }
+
+  function playbackAttributeWasRelevant(mutation) {
+    const oldValue = String(mutation.oldValue || "");
+    switch (mutation.attributeName) {
+      case "data-role":
+        return [
+          `${EVENT_TOKEN}VideoContainerEl`,
+          `ima${EVENT_TITLE_TOKEN}ContainerEl`,
+          `gv${EVENT_TITLE_TOKEN}ContainerEl`
+        ].some((value) => value === oldValue);
+      case "id":
+        return [
+          `mid${EVENT_TITLE_TOKEN}VideoContainer`,
+          `mid${EVENT_TITLE_TOKEN}PlayerWrapper`
+        ].some((value) => value === oldValue);
+      case "class":
+        return /(?:ad_|advert)/i.test(oldValue);
+      case "src":
+        return elementMatchesOrContains(mutation.target, "video");
+      case "data-nlog-area":
+        return oldValue === `${EVENT_TOKEN}_blocking_info_layer`;
+      case "role":
+        return (
+          oldValue === "alertdialog" ||
+          (oldValue === "button" && isInterruptionSkipButton(mutation.target))
+        );
+      case "aria-modal":
+        return (
+          oldValue === "true" &&
+          mutation.target?.getAttribute?.("data-nlog-area") ===
+            `${EVENT_TOKEN}_blocking_info_layer`
+        );
+      case "aria-label":
+      case "title":
+        return EVENT_SKIP_PATTERN.test(oldValue);
+      default:
+        return false;
+    }
+  }
+
+  function playbackMutationsAreRelevant(mutations) {
+    for (const mutation of mutations || []) {
+      if (mutation.type === "attributes") {
+        if (mutation.attributeName === "class") {
+          const className =
+            typeof mutation.target?.className === "string"
+              ? mutation.target.className
+              : mutation.target?.getAttribute?.("class") || "";
+          if (
+            !/(?:ad_|advert)/i.test(
+              `${mutation.oldValue || ""} ${className}`
+            )
+          ) {
+            continue;
+          }
+        }
+        if (
+          playbackMutationNodeIsRelevant(mutation.target) ||
+          playbackAttributeWasRelevant(mutation)
+        ) {
+          return true;
+        }
+        continue;
+      }
+      if (
+        mutation.type === "characterData" &&
+        playbackMutationNodeIsRelevant(mutation.target)
+      ) {
+        return true;
+      }
+      if (mutation.type !== "childList") {
+        continue;
+      }
+      for (const nodes of [mutation.addedNodes, mutation.removedNodes]) {
+        for (const node of nodes || []) {
+          if (playbackMutationNodeIsRelevant(node)) {
+            return true;
+          }
+        }
+      }
+    }
+    return false;
+  }
+
+  function schedulePlaybackInterruptionScan() {
+    if (playbackInterruptionScanScheduled) {
+      return;
+    }
+    playbackInterruptionScanScheduled = true;
+    const enqueue =
+      typeof queueMicrotask === "function"
+        ? queueMicrotask
+        : (callback) => Promise.resolve().then(callback);
+    enqueue(() => {
+      playbackInterruptionScanScheduled = false;
+      settlePlaybackInterruptions();
+    });
   }
 
   function startDomWatchers() {
     applyVisualGuard();
 
-    const observer = new MutationObserver(settlePlaybackInterruptions);
+    const observer = new MutationObserver((mutations) => {
+      if (playbackMutationsAreRelevant(mutations)) {
+        schedulePlaybackInterruptionScan();
+      }
+    });
     observer.observe(document.documentElement, {
       childList: true,
-      subtree: true
+      subtree: true,
+      characterData: true,
+      attributes: true,
+      attributeOldValue: true,
+      attributeFilter: [
+        "data-role",
+        "id",
+        "class",
+        "src",
+        "data-nlog-area",
+        "role",
+        "aria-modal",
+        "aria-label",
+        "title"
+      ]
     });
 
     if (ownsPlaybackTransport) {
+      for (const eventName of ["loadstart", "emptied"]) {
+        document.addEventListener(
+          eventName,
+          (event) => {
+            if (event.target instanceof HTMLVideoElement) {
+              resetAuxiliaryPlaybackState(event.target, {
+                invalidatePreviousRestore: eventName === "loadstart"
+              });
+            }
+          },
+          true
+        );
+      }
+
       for (const eventName of ["loadedmetadata", "durationchange", "play", "playing"]) {
         document.addEventListener(
           eventName,

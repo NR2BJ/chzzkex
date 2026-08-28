@@ -48,22 +48,50 @@ function createRuntime(options = {}) {
   const fetchCalls = [];
   const subtleDecryptCalls = [];
   const intervalCallbacks = [];
+  const microtaskCallbacks = [];
   const mutationCallbacks = [];
+  const mutationObserverOptions = [];
   const timeoutCallbacks = [];
   const videos = [];
+  const buttons = [];
+  const querySelectorAllCalls = new Map();
   const classNames = new Set();
   const auxiliaryClassNames = new Set();
   const playbackRejectionClassNames = new Set();
   const playbackRejectionAttributes = new Map();
   const playbackRejectionBackdropClassNames = new Set();
   const playbackRejectionBackdropAttributes = new Map();
+  let auxiliaryPresent = options.auxiliaryPresent !== false;
   let playbackRejectionPresent = Boolean(options.playbackRejectionPresent);
   let noticeCloseClicks = 0;
+  let skipButtonClicks = 0;
   const auxiliaryElement = {
+    nodeType: 1,
+    localName: "div",
+    textContent: "광고",
     classList: {
       add(name) {
         auxiliaryClassNames.add(name);
       }
+    },
+    closest(selector) {
+      return selector.includes("VideoContainerEl") ? this : null;
+    },
+    getAttribute(name) {
+      return {
+        "data-role": "adVideoContainerEl",
+        id: "midAdVideoContainer",
+        class: "ad_container"
+      }[name] ?? null;
+    },
+    matches(selector) {
+      return selector.includes("VideoContainerEl");
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
     }
   };
   const bodyElement = {};
@@ -81,6 +109,8 @@ function createRuntime(options = {}) {
     }
   };
   const playbackRejectionElement = {
+    nodeType: 1,
+    localName: "div",
     parentElement: playbackRejectionBackdrop,
     classList: {
       add(name) {
@@ -97,6 +127,18 @@ function createRuntime(options = {}) {
         ? playbackRejectionAttributes.get(name)
         : baseAttributes[name] ?? null;
     },
+    closest(selector) {
+      return selector.includes("_blocking_info_layer") ? this : null;
+    },
+    matches(selector) {
+      return selector.includes("_blocking_info_layer");
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    },
     setAttribute(name, value) {
       playbackRejectionAttributes.set(name, value);
     }
@@ -110,7 +152,9 @@ function createRuntime(options = {}) {
       mutationCallbacks.push(callback);
     }
 
-    observe() {}
+    observe(target, observerOptions) {
+      mutationObserverOptions.push({ target, options: observerOptions });
+    }
   }
 
   class FakeEventTarget {
@@ -187,12 +231,15 @@ function createRuntime(options = {}) {
 
   class FakeVideoElement {
     constructor({ auxiliary = true, paused = false, readyState = 4 } = {}) {
+      this.nodeType = 1;
+      this.localName = "video";
       this.auxiliary = auxiliary;
       this.currentSrc = auxiliary
         ? "https://api.chzzk.naver.com/service/t/media"
         : "blob:https://chzzk.naver.com/live";
       this.currentTime = 0;
       this.duration = 30;
+      this.isConnected = true;
       this.muted = false;
       this.paused = paused;
       this.playbackRate = 1;
@@ -200,10 +247,78 @@ function createRuntime(options = {}) {
       this.src = this.currentSrc;
     }
 
-    closest() {
+    closest(selector) {
+      if (selector.includes("button")) {
+        return null;
+      }
       return this.auxiliary ? auxiliaryElement : null;
     }
+
+    matches(selector) {
+      return /(^|,\s*)video(?:,|$)/.test(selector);
+    }
+
+    querySelector() {
+      return null;
+    }
+
+    querySelectorAll() {
+      return [];
+    }
   }
+
+  function createSkipButton(text = "광고 건너뛰기") {
+    const attributes = new Map();
+    const button = {
+      nodeType: 1,
+      localName: "button",
+      textContent: text,
+      disabled: false,
+      click() {
+        skipButtonClicks += 1;
+      },
+      closest(selector) {
+        if (selector.includes("button")) {
+          return this;
+        }
+        return selector.includes("VideoContainerEl") ? auxiliaryElement : null;
+      },
+      getAttribute(name) {
+        return attributes.get(name) ?? null;
+      },
+      setAttribute(name, value) {
+        attributes.set(name, String(value));
+      },
+      matches(selector) {
+        return selector.includes("button");
+      },
+      querySelector() {
+        return null;
+      },
+      querySelectorAll() {
+        return [];
+      }
+    };
+    buttons.push(button);
+    return button;
+  }
+
+  const unrelatedNode = {
+    nodeType: 1,
+    localName: "div",
+    closest() {
+      return null;
+    },
+    matches() {
+      return false;
+    },
+    querySelector() {
+      return null;
+    },
+    querySelectorAll() {
+      return [];
+    }
+  };
 
   const document = {
     body: bodyElement,
@@ -238,11 +353,18 @@ function createRuntime(options = {}) {
       return null;
     },
     querySelectorAll(selector) {
+      querySelectorAllCalls.set(
+        selector,
+        (querySelectorAllCalls.get(selector) || 0) + 1
+      );
       if (selector === "video") {
         return videos;
       }
+      if (selector === "button, [role='button']") {
+        return buttons;
+      }
       if (selector.includes("VideoContainerEl")) {
-        return [auxiliaryElement];
+        return auxiliaryPresent ? [auxiliaryElement] : [];
       }
       if (selector.includes("_blocking_info_layer")) {
         return playbackRejectionPresent ? [playbackRejectionElement] : [];
@@ -269,6 +391,9 @@ function createRuntime(options = {}) {
     console,
     document,
     location: { href: "https://chzzk.naver.com/live/channel" },
+    queueMicrotask(callback) {
+      microtaskCallbacks.push(callback);
+    },
     setInterval(callback) {
       intervalCallbacks.push(callback);
       return 1;
@@ -323,8 +448,10 @@ function createRuntime(options = {}) {
 
   return {
     auxiliaryClassNames,
+    auxiliaryElement,
     classNames,
     context,
+    createSkipButton,
     createVideo(options) {
       const video = new FakeVideoElement(options);
       videos.push(video);
@@ -337,29 +464,74 @@ function createRuntime(options = {}) {
     },
     fetchCalls,
     intervalCallbacks,
-    flushMutations() {
+    flushMicrotasks() {
+      while (microtaskCallbacks.length > 0) {
+        const callbacks = microtaskCallbacks.splice(0);
+        for (const callback of callbacks) {
+          callback();
+        }
+      }
+    },
+    flushMutations(mutations = []) {
       for (const callback of mutationCallbacks) {
-        callback([]);
+        callback(mutations);
       }
     },
     flushTimeouts(delay) {
-      for (const entry of timeoutCallbacks.filter((entry) => entry.delay === delay)) {
+      const callbacks = timeoutCallbacks.filter((entry) => entry.delay === delay);
+      for (let index = timeoutCallbacks.length - 1; index >= 0; index -= 1) {
+        if (timeoutCallbacks[index].delay === delay) {
+          timeoutCallbacks.splice(index, 1);
+        }
+      }
+      for (const entry of callbacks) {
         entry.callback();
       }
+    },
+    flushNextTimeout(delay) {
+      const index = timeoutCallbacks.findIndex((entry) => entry.delay === delay);
+      if (index < 0) {
+        return false;
+      }
+
+      const [entry] = timeoutCallbacks.splice(index, 1);
+      entry.callback();
+      return true;
     },
     nativeFetch,
     nativeXhrOpen,
     nativeXhrSend,
+    mutationObserverOptions,
     playbackRejectionAttributes,
     playbackRejectionBackdropAttributes,
     playbackRejectionBackdropClassNames,
     playbackRejectionClassNames,
+    playbackRejectionElement,
+    querySelectorAllCallCount(selector) {
+      return querySelectorAllCalls.get(selector) || 0;
+    },
+    querySelectorAllCallTotal() {
+      return Array.from(querySelectorAllCalls.values()).reduce(
+        (total, count) => total + count,
+        0
+      );
+    },
+    resetQuerySelectorAllCalls() {
+      querySelectorAllCalls.clear();
+    },
+    setAuxiliaryPresent(present) {
+      auxiliaryPresent = present;
+    },
     setPlaybackRejectionPresent(present) {
       playbackRejectionPresent = present;
     },
     subtleDecryptCalls,
+    unrelatedNode,
     noticeCloseClicks() {
       return noticeCloseClicks;
+    },
+    skipButtonClicks() {
+      return skipButtonClicks;
     }
   };
 }
@@ -558,6 +730,284 @@ test("advances auxiliary playback after the player settles once", () => {
   assert.equal(video.muted, false);
   assert.equal(video.playbackRate, 1);
   assert.equal(video.currentTime, 0);
+});
+
+test("advances a reused auxiliary video once for each changed source", () => {
+  const runtime = createRuntime();
+  runtime.context.advanceCalls = [];
+  vm.runInContext(
+    `(() => {
+      const eventName = ["ui", "ad", "skip"].join("_");
+      const listenerTable = {};
+      listenerTable[eventName] = [() => advanceCalls.push("complete")];
+    })()`,
+    runtime.context
+  );
+  const video = runtime.createVideo();
+
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.flushTimeouts(150);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), ["complete"]);
+
+  video.currentSrc = "https://glad-vod.pstatic.net/next-ad.mp4";
+  video.src = video.currentSrc;
+  video.currentTime = 0;
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.flushTimeouts(150);
+
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), [
+    "complete",
+    "complete"
+  ]);
+});
+
+test("advances the same auxiliary URL again after loadstart", () => {
+  const runtime = createRuntime();
+  runtime.context.advanceCalls = [];
+  vm.runInContext(
+    `(() => {
+      const eventName = ["ui", "ad", "skip"].join("_");
+      const listenerTable = {};
+      listenerTable[eventName] = [() => advanceCalls.push("complete")];
+    })()`,
+    runtime.context
+  );
+  const video = runtime.createVideo();
+
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.flushTimeouts(150);
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.flushTimeouts(150);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), ["complete"]);
+
+  runtime.dispatchDocumentEvent("loadstart", video);
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.flushTimeouts(150);
+
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), [
+    "complete",
+    "complete"
+  ]);
+});
+
+test("ignores a pending callback after the auxiliary source changes", () => {
+  const runtime = createRuntime();
+  runtime.context.advanceCalls = [];
+  vm.runInContext(
+    `(() => {
+      const eventName = ["ui", "ad", "skip"].join("_");
+      const listenerTable = {};
+      listenerTable[eventName] = [() => advanceCalls.push("complete")];
+    })()`,
+    runtime.context
+  );
+  const video = runtime.createVideo();
+
+  runtime.dispatchDocumentEvent("playing", video);
+  video.src = "https://video-gfa.pstatic.net/replacement-ad.mp4";
+  runtime.flushTimeouts(150);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), []);
+
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.flushTimeouts(150);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), ["complete"]);
+});
+
+test("does not restore primary mute state from a stale auxiliary generation", () => {
+  const runtime = createRuntime();
+  runtime.context.advanceCalls = [];
+  vm.runInContext(
+    `(() => {
+      const eventName = ["ui", "ad", "skip"].join("_");
+      const listenerTable = {};
+      listenerTable[eventName] = [() => advanceCalls.push("complete")];
+    })()`,
+    runtime.context
+  );
+  const primary = runtime.createVideo({ auxiliary: false });
+  runtime.dispatchDocumentEvent("playing", primary);
+  runtime.flushTimeouts(750);
+  const auxiliary = runtime.createVideo();
+
+  runtime.dispatchDocumentEvent("playing", auxiliary);
+  auxiliary.src = "https://video-gfa.pstatic.net/replacement-ad.mp4";
+  runtime.flushTimeouts(150);
+  primary.muted = true;
+  runtime.dispatchDocumentEvent("playing", primary);
+  runtime.flushTimeouts(0);
+
+  assert.equal(primary.muted, true);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), []);
+});
+
+test("invalidates an earlier restore as soon as the next loadstart begins", () => {
+  const runtime = createRuntime();
+  runtime.context.advanceCalls = [];
+  vm.runInContext(
+    `(() => {
+      const eventName = ["ui", "ad", "skip"].join("_");
+      const listenerTable = {};
+      listenerTable[eventName] = [() => advanceCalls.push("complete")];
+    })()`,
+    runtime.context
+  );
+  const primary = runtime.createVideo({ auxiliary: false });
+  runtime.dispatchDocumentEvent("playing", primary);
+  runtime.flushTimeouts(750);
+  const auxiliary = runtime.createVideo();
+
+  runtime.dispatchDocumentEvent("playing", auxiliary);
+  runtime.flushTimeouts(150);
+  auxiliary.readyState = 0;
+  runtime.dispatchDocumentEvent("loadstart", auxiliary);
+  primary.muted = true;
+
+  assert.equal(runtime.flushNextTimeout(500), true);
+  assert.equal(primary.muted, true);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), ["complete"]);
+});
+
+test("restores only from the next generation after loadstart", () => {
+  const runtime = createRuntime();
+  runtime.context.advanceCalls = [];
+  vm.runInContext(
+    `(() => {
+      const eventName = ["ui", "ad", "skip"].join("_");
+      const listenerTable = {};
+      listenerTable[eventName] = [() => advanceCalls.push("complete")];
+    })()`,
+    runtime.context
+  );
+  const primary = runtime.createVideo({ auxiliary: false });
+  runtime.dispatchDocumentEvent("playing", primary);
+  runtime.flushTimeouts(750);
+  const auxiliary = runtime.createVideo();
+
+  runtime.dispatchDocumentEvent("playing", auxiliary);
+  runtime.flushTimeouts(150);
+  auxiliary.readyState = 0;
+  runtime.dispatchDocumentEvent("loadstart", auxiliary);
+  primary.muted = true;
+
+  assert.equal(runtime.flushNextTimeout(500), true);
+  assert.equal(primary.muted, true);
+
+  auxiliary.readyState = 4;
+  runtime.dispatchDocumentEvent("playing", auxiliary);
+  runtime.flushTimeouts(150);
+  assert.equal(runtime.flushNextTimeout(500), true);
+  assert.equal(primary.muted, false);
+  assert.equal(runtime.flushNextTimeout(500), false);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), [
+    "complete",
+    "complete"
+  ]);
+});
+
+test("invalidates an earlier restore when a new nonempty source is observed", () => {
+  const runtime = createRuntime();
+  runtime.context.advanceCalls = [];
+  vm.runInContext(
+    `(() => {
+      const eventName = ["ui", "ad", "skip"].join("_");
+      const listenerTable = {};
+      listenerTable[eventName] = [() => advanceCalls.push("complete")];
+    })()`,
+    runtime.context
+  );
+  const primary = runtime.createVideo({ auxiliary: false });
+  runtime.dispatchDocumentEvent("playing", primary);
+  runtime.flushTimeouts(750);
+  const auxiliary = runtime.createVideo();
+
+  runtime.dispatchDocumentEvent("playing", auxiliary);
+  runtime.flushTimeouts(150);
+  auxiliary.readyState = 0;
+  auxiliary.currentSrc = "https://glad-vod.pstatic.net/next-ad.mp4";
+  auxiliary.src = auxiliary.currentSrc;
+  runtime.dispatchDocumentEvent("loadedmetadata", auxiliary);
+  primary.muted = true;
+
+  assert.equal(runtime.flushNextTimeout(500), true);
+  assert.equal(primary.muted, true);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), ["complete"]);
+});
+
+test("restores primary mute after an advanced auxiliary video is emptied", () => {
+  const runtime = createRuntime();
+  runtime.context.advanceCalls = [];
+  vm.runInContext(
+    `(() => {
+      const eventName = ["ui", "ad", "skip"].join("_");
+      const listenerTable = {};
+      listenerTable[eventName] = [() => advanceCalls.push("complete")];
+    })()`,
+    runtime.context
+  );
+  const primary = runtime.createVideo({ auxiliary: false });
+  runtime.dispatchDocumentEvent("playing", primary);
+  runtime.flushTimeouts(750);
+  const auxiliary = runtime.createVideo();
+
+  runtime.dispatchDocumentEvent("playing", auxiliary);
+  runtime.flushTimeouts(150);
+  runtime.dispatchDocumentEvent("emptied", auxiliary);
+  primary.muted = true;
+  runtime.flushTimeouts(500);
+
+  assert.equal(primary.muted, false);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), ["complete"]);
+});
+
+test("ignores a pending callback after an auxiliary video is emptied", () => {
+  const runtime = createRuntime();
+  runtime.context.advanceCalls = [];
+  vm.runInContext(
+    `(() => {
+      const eventName = ["ui", "ad", "skip"].join("_");
+      const listenerTable = {};
+      listenerTable[eventName] = [() => advanceCalls.push("complete")];
+    })()`,
+    runtime.context
+  );
+  const video = runtime.createVideo();
+
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.dispatchDocumentEvent("emptied", video);
+  runtime.flushTimeouts(150);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), []);
+
+  runtime.dispatchDocumentEvent("playing", video);
+  runtime.flushTimeouts(150);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), ["complete"]);
+});
+
+test("ignores a pending callback after an auxiliary video is detached or reused as primary", () => {
+  const runtime = createRuntime();
+  runtime.context.advanceCalls = [];
+  vm.runInContext(
+    `(() => {
+      const eventName = ["ui", "ad", "skip"].join("_");
+      const listenerTable = {};
+      listenerTable[eventName] = [() => advanceCalls.push("complete")];
+    })()`,
+    runtime.context
+  );
+  const video = runtime.createVideo();
+
+  runtime.dispatchDocumentEvent("playing", video);
+  video.isConnected = false;
+  runtime.flushTimeouts(150);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), []);
+
+  video.isConnected = true;
+  runtime.dispatchDocumentEvent("playing", video);
+  video.auxiliary = false;
+  runtime.flushTimeouts(150);
+  assert.deepEqual(Array.from(runtime.context.advanceCalls), []);
 });
 
 test("keeps the auxiliary media fallback when no player listener is available", () => {
@@ -1072,6 +1522,177 @@ test("preserves opaque tunnel responses byte-for-byte", async () => {
   );
 });
 
+test("ignores unrelated DOM churn while keeping the periodic playback fallback", () => {
+  const runtime = createRuntime();
+  runtime.resetQuerySelectorAllCalls();
+
+  runtime.flushMutations([
+    {
+      type: "childList",
+      addedNodes: [runtime.unrelatedNode],
+      removedNodes: []
+    },
+    {
+      type: "attributes",
+      attributeName: "class",
+      oldValue: "chat_message",
+      target: runtime.unrelatedNode
+    },
+    {
+      type: "characterData",
+      target: { nodeType: 3, parentElement: runtime.unrelatedNode }
+    }
+  ]);
+  runtime.flushMicrotasks();
+  assert.equal(runtime.querySelectorAllCallTotal(), 0);
+
+  for (const callback of runtime.intervalCallbacks) {
+    callback();
+  }
+  assert.ok(runtime.querySelectorAllCallTotal() > 0);
+});
+
+test("coalesces dynamic auxiliary, video, popup, and skip additions", () => {
+  const runtime = createRuntime({ auxiliaryPresent: false });
+  runtime.auxiliaryClassNames.clear();
+  runtime.playbackRejectionClassNames.clear();
+  runtime.playbackRejectionAttributes.clear();
+  runtime.setAuxiliaryPresent(true);
+  runtime.setPlaybackRejectionPresent(true);
+  const video = runtime.createVideo();
+  const skipButton = runtime.createSkipButton();
+  runtime.resetQuerySelectorAllCalls();
+
+  const mutations = [
+    runtime.auxiliaryElement,
+    video,
+    runtime.playbackRejectionElement,
+    skipButton
+  ].map((node) => ({
+    type: "childList",
+    addedNodes: [node],
+    removedNodes: []
+  }));
+  runtime.flushMutations(mutations);
+  runtime.flushMutations(mutations);
+  runtime.flushMicrotasks();
+
+  assert.equal(
+    runtime.auxiliaryClassNames.has("chzzk-ex-auxiliary"),
+    true
+  );
+  assert.equal(video.muted, true);
+  assert.equal(video.playbackRate, 16);
+  assert.equal(video.currentTime, 29.95);
+  assert.equal(runtime.skipButtonClicks(), 1);
+  assert.equal(
+    runtime.playbackRejectionClassNames.has(
+      "chzzk-ex-playback-rejection-hidden"
+    ),
+    true
+  );
+  assert.equal(runtime.querySelectorAllCallCount("video"), 1);
+  assert.equal(runtime.querySelectorAllCallCount("button, [role='button']"), 1);
+});
+
+test("observes relevant attribute hydration and skip text changes", () => {
+  const runtime = createRuntime({ auxiliaryPresent: false });
+  const observerOptions = runtime.mutationObserverOptions[0]?.options;
+  assert.equal(observerOptions?.attributes, true);
+  assert.equal(observerOptions?.attributeOldValue, true);
+  assert.equal(observerOptions?.characterData, true);
+  assert.deepEqual(Array.from(observerOptions?.attributeFilter || []), [
+    "data-role",
+    "id",
+    "class",
+    "src",
+    "data-nlog-area",
+    "role",
+    "aria-modal",
+    "aria-label",
+    "title"
+  ]);
+
+  runtime.setAuxiliaryPresent(true);
+  runtime.setPlaybackRejectionPresent(true);
+  const video = runtime.createVideo();
+  const skipButton = runtime.createSkipButton("잠시만요");
+  const attributeTargets = new Map([
+    ["data-role", runtime.auxiliaryElement],
+    ["id", runtime.auxiliaryElement],
+    ["class", runtime.auxiliaryElement],
+    ["src", video],
+    ["data-nlog-area", runtime.playbackRejectionElement],
+    ["role", runtime.playbackRejectionElement],
+    ["aria-modal", runtime.playbackRejectionElement],
+    ["aria-label", skipButton],
+    ["title", skipButton]
+  ]);
+  for (const [attributeName, target] of attributeTargets) {
+    runtime.resetQuerySelectorAllCalls();
+    runtime.flushMutations([
+      { type: "attributes", attributeName, target }
+    ]);
+    runtime.flushMicrotasks();
+    assert.ok(
+      runtime.querySelectorAllCallTotal() > 0,
+      `${attributeName} hydration should schedule a playback scan`
+    );
+  }
+
+  skipButton.textContent = "광고 건너뛰기";
+  runtime.flushMutations([
+    {
+      type: "characterData",
+      target: { nodeType: 3, parentElement: skipButton }
+    }
+  ]);
+  runtime.flushMicrotasks();
+  assert.ok(runtime.skipButtonClicks() > 0);
+});
+
+test("uses a title-only label on an auxiliary skip control", () => {
+  const runtime = createRuntime();
+  const skipButton = runtime.createSkipButton("");
+  skipButton.setAttribute("title", "광고 건너뛰기");
+
+  runtime.flushMutations([
+    {
+      type: "attributes",
+      attributeName: "title",
+      oldValue: null,
+      target: skipButton
+    }
+  ]);
+  runtime.flushMicrotasks();
+
+  assert.equal(runtime.skipButtonClicks(), 1);
+});
+
+test("settles a playback popup immediately when its identifying attribute is removed", () => {
+  const runtime = createRuntime({ playbackRejectionPresent: true });
+  assert.equal(
+    runtime.classNames.has("chzzk-ex-playback-rejection-active"),
+    true
+  );
+
+  runtime.setPlaybackRejectionPresent(false);
+  runtime.flushMutations([
+    {
+      type: "attributes",
+      attributeName: "data-nlog-area",
+      oldValue: "ad_blocking_info_layer",
+      target: runtime.unrelatedNode
+    }
+  ]);
+  runtime.flushMicrotasks();
+
+  assert.equal(
+    runtime.classNames.has("chzzk-ex-playback-rejection-active"),
+    false
+  );
+});
+
 test("hides the dedicated playback rejection layer without clicking generic notices", () => {
   const runtime = createRuntime({ playbackRejectionPresent: true });
 
@@ -1079,7 +1700,14 @@ test("hides the dedicated playback rejection layer without clicking generic noti
   runtime.playbackRejectionAttributes.clear();
   runtime.playbackRejectionBackdropClassNames.clear();
   runtime.playbackRejectionBackdropAttributes.clear();
-  runtime.flushMutations();
+  runtime.flushMutations([
+    {
+      type: "childList",
+      addedNodes: [runtime.playbackRejectionElement],
+      removedNodes: []
+    }
+  ]);
+  runtime.flushMicrotasks();
 
   assert.equal(
     runtime.playbackRejectionClassNames.has(
@@ -1106,7 +1734,14 @@ test("hides the dedicated playback rejection layer without clicking generic noti
   assert.equal(runtime.noticeCloseClicks(), 0);
 
   runtime.setPlaybackRejectionPresent(false);
-  runtime.flushMutations();
+  runtime.flushMutations([
+    {
+      type: "childList",
+      addedNodes: [],
+      removedNodes: [runtime.playbackRejectionElement]
+    }
+  ]);
+  runtime.flushMicrotasks();
   assert.equal(
     runtime.classNames.has("chzzk-ex-playback-rejection-active"),
     false
@@ -1127,7 +1762,14 @@ for (const [structure, options] of [
     runtime.playbackRejectionAttributes.clear();
     runtime.playbackRejectionBackdropClassNames.clear();
     runtime.playbackRejectionBackdropAttributes.clear();
-    runtime.flushMutations();
+    runtime.flushMutations([
+      {
+        type: "childList",
+        addedNodes: [runtime.playbackRejectionElement],
+        removedNodes: []
+      }
+    ]);
+    runtime.flushMicrotasks();
 
     assert.equal(
       runtime.playbackRejectionClassNames.has(

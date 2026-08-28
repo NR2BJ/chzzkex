@@ -19,6 +19,10 @@ test("classifies the current CHZZK playback endpoints", () => {
       core.REQUEST_KIND.DISPLAY_STATUS
     ],
     [
+      "https://api.chzzk.naver.com/service/v1/seoraksan?pgType=CHZZK_LIVE&pgId=channel-id",
+      core.REQUEST_KIND.DISPLAY_STATUS
+    ],
+    [
       `https://api.chzzk.naver.com/${EVENT_TOKEN}-polling/v1/lives/20145400/${EVENT_TOKEN}?ts=123`,
       core.REQUEST_KIND.PLAYBACK_EVENT
     ],

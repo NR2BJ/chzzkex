@@ -27,8 +27,10 @@ function createRuntime({
   const mutationObservers = [];
   const queryCounts = new Map();
   const timeoutCallbacks = new Map();
+  const documentListeners = new Map();
   const windowListeners = new Map();
   let nextTimerId = 1;
+  let nowMs = 0;
   let currentNicknameStyle = nicknameStyle;
   let nicknameStyleReads = 0;
 
@@ -44,12 +46,28 @@ function createRuntime({
       return false;
     }
 
+    if (trimmed === "*") {
+      return true;
+    }
+
+    if (trimmed.startsWith("#")) {
+      return element.getAttribute("id") === trimmed.slice(1);
+    }
+
+    const classAttributeMatch = trimmed.match(/^(\.[\w-]+)(\[.+\])$/);
+    if (classAttributeMatch) {
+      return (
+        matchesSimpleSelector(element, classAttributeMatch[1]) &&
+        matchesSimpleSelector(element, classAttributeMatch[2])
+      );
+    }
+
     if (trimmed.startsWith(".")) {
       return element.classList.contains(trimmed.slice(1));
     }
 
     const attributeMatch = trimmed.match(
-      /^(?:([a-z]+))?\[([\w-]+)(?:(\*=|=)('[^']*'|"[^"]*"))?\]$/i
+      /^(?:([a-z]+))?\[([\w-]+)(?:(\*=|\^=|=)('[^']*'|"[^"]*"))?\]$/i
     );
     if (attributeMatch) {
       const [, tagName, attribute, operator, quotedValue] = attributeMatch;
@@ -61,9 +79,13 @@ function createRuntime({
         return value !== null;
       }
       const expected = quotedValue.slice(1, -1);
-      return operator === "*="
-        ? String(value || "").includes(expected)
-        : value === expected;
+      if (operator === "*=") {
+        return String(value || "").includes(expected);
+      }
+      if (operator === "^=") {
+        return String(value || "").startsWith(expected);
+      }
+      return value === expected;
     }
 
     return element.tagName === trimmed.toUpperCase();
@@ -118,6 +140,12 @@ function createRuntime({
         },
         [Symbol.iterator]: () => this._classNames.values()
       };
+      this.style = {
+        values: new Map(),
+        setProperty: (name, value) => {
+          this.style.values.set(name, String(value));
+        }
+      };
     }
 
     get className() {
@@ -163,6 +191,23 @@ function createRuntime({
       return this.insertBefore(child, null);
     }
 
+    append(...children) {
+      for (const child of children) {
+        this.appendChild(child);
+      }
+    }
+
+    contains(candidate) {
+      let current = candidate;
+      while (current) {
+        if (current === this) {
+          return true;
+        }
+        current = current.parentElement;
+      }
+      return false;
+    }
+
     closest(selector) {
       let current = this;
       while (current) {
@@ -183,6 +228,10 @@ function createRuntime({
         return value === undefined ? null : String(value);
       }
       return this.attributes.has(name) ? this.attributes.get(name) : null;
+    }
+
+    hasAttribute(name) {
+      return this.getAttribute(name) !== null;
     }
 
     insertBefore(child, reference) {
@@ -226,6 +275,17 @@ function createRuntime({
       return matches;
     }
 
+    getBoundingClientRect() {
+      return this.bounds || {
+        left: 0,
+        right: 100,
+        top: 0,
+        bottom: 20,
+        width: 100,
+        height: 20
+      };
+    }
+
     remove() {
       this.removeCount += 1;
       if (!this.parentElement) {
@@ -236,6 +296,16 @@ function createRuntime({
         this.parentElement.children.splice(index, 1);
       }
       this.parentElement = null;
+    }
+
+    removeAttribute(name) {
+      if (name === "class") {
+        this._classNames.clear();
+      } else if (name.startsWith("data-")) {
+        delete this.dataset[dataName(name)];
+      } else {
+        this.attributes.delete(name);
+      }
     }
 
     setAttribute(name, value) {
@@ -261,10 +331,20 @@ function createRuntime({
       this.target = target;
       this.options = options;
     }
+
+    disconnect() {
+      this.target = null;
+      this.options = null;
+    }
   }
 
   const document = {
-    addEventListener() {},
+    visibilityState: "visible",
+    addEventListener(type, listener) {
+      const current = documentListeners.get(type) || [];
+      current.push(listener);
+      documentListeners.set(type, current);
+    },
     createElement(tagName) {
       return new FakeHTMLElement(tagName);
     },
@@ -327,15 +407,26 @@ function createRuntime({
     clearTimeout(id) {
       timeoutCallbacks.delete(id);
     },
+    clearInterval(id) {
+      const index = intervals.findIndex((entry) => entry.id === id);
+      if (index >= 0) {
+        intervals.splice(index, 1);
+      }
+    },
     console,
     document,
     HTMLElement: FakeHTMLElement,
+    HTMLMediaElement: {
+      HAVE_METADATA: 1,
+      HAVE_CURRENT_DATA: 2
+    },
+    HTMLVideoElement: FakeHTMLElement,
     location: {
       href: "https://chzzk.naver.com/live/channel",
       pathname: "/live/channel"
     },
     MutationObserver: FakeMutationObserver,
-    performance: { now: () => 0 },
+    performance: { now: () => nowMs },
     getComputedStyle(element) {
       if (element === nickname) {
         nicknameStyleReads += 1;
@@ -344,7 +435,9 @@ function createRuntime({
       return {
         color: "rgb(20, 21, 23)",
         backgroundImage: "none",
-        backgroundClip: "border-box"
+        backgroundClip: "border-box",
+        display: "block",
+        visibility: "visible"
       };
     },
     setInterval(callback, delay) {
@@ -374,8 +467,107 @@ function createRuntime({
     vm.runInContext(script.source, context, { filename: script.file });
   }
 
+  function timeRanges(entries) {
+    return {
+      length: entries.length,
+      start(index) {
+        return entries[index][0];
+      },
+      end(index) {
+        return entries[index][1];
+      }
+    };
+  }
+
+  function addPlayer({
+    currentTime = 99.5,
+    seekable = [[0, 100]],
+    buffered = [[0, 100]],
+    nativeTimeline = false,
+    onLive = false
+  } = {}) {
+    const player = new FakeHTMLElement("div");
+    player.className = `pzp-pc pzp-pc--controls${onLive ? " pzp-pc--onlive" : ""}`;
+    const video = new FakeHTMLElement("video");
+    video.readyState = 4;
+    video.currentTime = currentTime;
+    video.currentSrc = "https://example.test/live.m3u8";
+    video.src = video.currentSrc;
+    video.paused = false;
+    video.ended = false;
+    video.seekable = timeRanges(seekable);
+    video.buffered = timeRanges(buffered);
+    video.volume = 1;
+    video.muted = false;
+    const controls = new FakeHTMLElement("div");
+    controls.className = "pzp-pc__bottom-buttons-left";
+    player.append(video, controls);
+
+    let nativeSlider = null;
+    if (nativeTimeline) {
+      nativeSlider = new FakeHTMLElement("div");
+      nativeSlider.className = "pzp-pc-progress-slider";
+      nativeSlider.setAttribute("role", "slider");
+      nativeSlider.bounds = {
+        left: 0,
+        right: 800,
+        top: 0,
+        bottom: 14,
+        width: 800,
+        height: 14
+      };
+      player.appendChild(nativeSlider);
+    }
+    document.body.appendChild(player);
+    return { controls, nativeSlider, player, video };
+  }
+
+  function addSidebarLink() {
+    const sidebar = new FakeHTMLElement("aside");
+    sidebar.setAttribute("id", "sidebar");
+    const link = new FakeHTMLElement("a");
+    link.setAttribute(
+      "href",
+      "/live/0123456789abcdef0123456789abcdef"
+    );
+    link.setAttribute("title", "테스트 방송");
+    link.textContent = "테스트 방송";
+    sidebar.appendChild(link);
+    document.body.appendChild(sidebar);
+    return link;
+  }
+
+  function dispatchDocumentEvent(type, event = {}) {
+    const payload = {
+      button: 0,
+      isTrusted: false,
+      preventDefault() {
+        this.defaultPrevented = true;
+      },
+      stopPropagation() {
+        this.propagationStopped = true;
+      },
+      stopImmediatePropagation() {
+        this.propagationStopped = true;
+        this.immediatePropagationStopped = true;
+      },
+      ...event
+    };
+    for (const listener of documentListeners.get(type) || []) {
+      listener(payload);
+      if (payload.immediatePropagationStopped) {
+        break;
+      }
+    }
+    return payload;
+  }
+
   function chatObserver() {
     return mutationObservers.find((observer) => observer.target === document.body);
+  }
+
+  function currentSidebarObserver() {
+    return mutationObservers.find((observer) => observer.target === document);
   }
 
   function dispatchSettings(settings) {
@@ -427,15 +619,21 @@ function createRuntime({
   return {
     BLIND_PLACEHOLDER,
     FakeHTMLElement,
+    addPlayer,
+    addSidebarLink,
     chatLog,
     chatObserverOptions() {
       const options = chatObserver()?.options;
       return options ? JSON.parse(JSON.stringify(options)) : null;
     },
     dispatchSettings,
+    dispatchDocumentEvent,
     document,
     flushTimeouts,
     item,
+    intervalCount(delay) {
+      return intervals.filter((entry) => entry.delay === delay).length;
+    },
     messageElement,
     nickname,
     notifyChat,
@@ -452,8 +650,18 @@ function createRuntime({
     },
     runInterval,
     runIntervals,
+    setNow(value) {
+      nowMs = value;
+    },
+    sidebarObserver() {
+      return currentSidebarObserver();
+    },
     setNicknameStyle(style) {
       currentNicknameStyle = style;
+    },
+    setLocation(pathname) {
+      context.location.pathname = pathname;
+      context.location.href = `https://chzzk.naver.com${pathname}`;
     },
     setMessage,
     timestamp() {
@@ -468,16 +676,282 @@ function createRuntime({
   };
 }
 
+test("restores the fallback timeline when a native slider disappears", () => {
+  const runtime = createRuntime();
+  const { nativeSlider, player } = runtime.addPlayer({ nativeTimeline: true });
+  runtime.dispatchSettings({ timelineAssist: true });
+
+  runtime.runIntervals(250);
+  assert.equal(player.querySelector(".cng-timeline-assist"), null);
+
+  nativeSlider.remove();
+  runtime.runIntervals(250);
+  assert.ok(player.querySelector(".cng-timeline-assist"));
+});
+
+test("protects trusted native timeline seeks from initial live synchronization", () => {
+  for (const interaction of [
+    { type: "pointerdown", event: { button: 0 } },
+    { type: "keydown", event: { key: "Home" } }
+  ]) {
+    const runtime = createRuntime();
+    const { nativeSlider, video } = runtime.addPlayer({
+      currentTime: 50,
+      nativeTimeline: true
+    });
+    runtime.dispatchSettings({ timelineAssist: true });
+    runtime.runIntervals(250);
+
+    runtime.dispatchDocumentEvent(interaction.type, {
+      ...interaction.event,
+      isTrusted: true,
+      target: nativeSlider
+    });
+    video.currentTime = 40;
+    runtime.setNow(1000);
+    runtime.runIntervals(250);
+    assert.equal(video.currentTime, 40);
+  }
+
+  const disabledRuntime = createRuntime();
+  const { video } = disabledRuntime.addPlayer({ currentTime: 40 });
+  disabledRuntime.dispatchSettings({ timelineAssist: false });
+  disabledRuntime.runIntervals(250);
+  disabledRuntime.setNow(1000);
+  disabledRuntime.runIntervals(250);
+  assert.equal(video.currentTime, 40);
+
+  const untrustedRuntime = createRuntime();
+  const untrustedPlayer = untrustedRuntime.addPlayer({
+    currentTime: 50,
+    nativeTimeline: true
+  });
+  untrustedRuntime.dispatchSettings({ timelineAssist: true });
+  untrustedRuntime.runIntervals(250);
+  untrustedRuntime.dispatchDocumentEvent("pointerdown", {
+    button: 0,
+    isTrusted: false,
+    target: untrustedPlayer.nativeSlider
+  });
+  untrustedPlayer.video.currentTime = 40;
+  untrustedRuntime.setNow(1000);
+  untrustedRuntime.runIntervals(250);
+  assert.equal(untrustedPlayer.video.currentTime, 99.75);
+
+  const routeRuntime = createRuntime();
+  const routePlayer = routeRuntime.addPlayer({
+    currentTime: 50,
+    nativeTimeline: true
+  });
+  routeRuntime.dispatchSettings({ timelineAssist: true });
+  routeRuntime.runIntervals(250);
+  routeRuntime.dispatchDocumentEvent("pointerdown", {
+    button: 0,
+    isTrusted: true,
+    target: routePlayer.nativeSlider
+  });
+  routePlayer.video.currentTime = 40;
+  routeRuntime.setLocation("/live/channel-b");
+  routeRuntime.setNow(100);
+  routeRuntime.runIntervals(250);
+  routeRuntime.setNow(1000);
+  routeRuntime.runIntervals(250);
+  assert.equal(routePlayer.video.currentTime, 99.75);
+});
+
+test("keeps a native seek made after an SPA URL change before the next tick", () => {
+  const runtime = createRuntime();
+  const { nativeSlider, video } = runtime.addPlayer({
+    currentTime: 50,
+    nativeTimeline: true
+  });
+  runtime.dispatchSettings({ timelineAssist: true });
+  runtime.runIntervals(250);
+
+  runtime.setLocation("/live/channel-b");
+  runtime.dispatchDocumentEvent("pointerdown", {
+    button: 0,
+    isTrusted: true,
+    target: nativeSlider
+  });
+  video.currentTime = 40;
+  runtime.setNow(100);
+  runtime.runIntervals(250);
+  runtime.setNow(1000);
+  runtime.runIntervals(250);
+
+  assert.equal(video.currentTime, 40);
+});
+
+test("treats external seeking and focused-player keys as restore intent", () => {
+  const seekingRuntime = createRuntime();
+  const seekingPlayer = seekingRuntime.addPlayer({
+    currentTime: 50,
+    nativeTimeline: true
+  });
+  seekingRuntime.dispatchSettings({ timelineAssist: true });
+  seekingRuntime.setNow(100);
+  seekingRuntime.runIntervals(250);
+  seekingPlayer.video.currentTime = 40;
+  seekingRuntime.dispatchDocumentEvent("seeking", {
+    target: seekingPlayer.video
+  });
+  seekingRuntime.setNow(1000);
+  seekingRuntime.runIntervals(250);
+  assert.equal(seekingPlayer.video.currentTime, 40);
+
+  for (const { focusedTarget, key } of [
+    { focusedTarget: "video", key: "j" },
+    { focusedTarget: "player", key: "L" },
+    { focusedTarget: "body", key: "l" }
+  ]) {
+    const runtime = createRuntime();
+    const playerState = runtime.addPlayer({
+      currentTime: 50,
+      nativeTimeline: true
+    });
+    runtime.dispatchSettings({ timelineAssist: true });
+    runtime.setNow(100);
+    runtime.runIntervals(250);
+    runtime.dispatchDocumentEvent("keydown", {
+      isTrusted: true,
+      key,
+      target:
+        focusedTarget === "video"
+          ? playerState.video
+          : focusedTarget === "player"
+            ? playerState.player
+            : runtime.document.body
+    });
+    playerState.video.currentTime = 40;
+    runtime.setNow(1000);
+    runtime.runIntervals(250);
+    assert.equal(playerState.video.currentTime, 40, `${focusedTarget}:${key}`);
+  }
+});
+
+test("does not treat the initial LIVE synchronization write as user seeking", () => {
+  const runtime = createRuntime();
+  const { controls, video } = runtime.addPlayer({
+    currentTime: 50,
+    nativeTimeline: true,
+    onLive: true
+  });
+  runtime.dispatchSettings({ timelineAssist: true, videoLatency: true });
+  runtime.setNow(100);
+  runtime.runIntervals(250);
+  runtime.setNow(1000);
+  runtime.runIntervals(250);
+  assert.equal(video.currentTime, 99.75);
+
+  runtime.dispatchDocumentEvent("seeking", { target: video });
+  runtime.runIntervals(500);
+  const status = controls.querySelector(".cng-video-latency");
+  assert.ok(status);
+  assert.match(status.textContent, /지연 0\.3초/);
+  assert.doesNotMatch(status.textContent, /LIVE까지/);
+});
+
+test("cancels a custom timeline drag without a final seek", () => {
+  const runtime = createRuntime();
+  const { player, video } = runtime.addPlayer({ currentTime: 99.5 });
+  runtime.dispatchSettings({ timelineAssist: true });
+  runtime.runIntervals(250);
+  const slider = player.querySelector(".cng-timeline-assist");
+  assert.ok(slider);
+
+  runtime.dispatchDocumentEvent("pointerdown", {
+    button: 0,
+    clientX: 25,
+    isTrusted: true,
+    pointerId: 7,
+    target: slider
+  });
+  const positionAfterPointerDown = video.currentTime;
+  runtime.dispatchDocumentEvent("pointercancel", {
+    clientX: 90,
+    isTrusted: true,
+    pointerId: 7,
+    target: slider
+  });
+  assert.equal(video.currentTime, positionAfterPointerDown);
+
+  runtime.dispatchDocumentEvent("pointerdown", {
+    button: 0,
+    clientX: 30,
+    isTrusted: true,
+    pointerId: 8,
+    target: slider
+  });
+  const positionBeforeDisable = video.currentTime;
+  runtime.dispatchSettings({ timelineAssist: false });
+  runtime.dispatchDocumentEvent("pointermove", {
+    clientX: 80,
+    isTrusted: true,
+    pointerId: 8,
+    target: slider
+  });
+  assert.equal(video.currentTime, positionBeforeDisable);
+  assert.equal(player.querySelector(".cng-timeline-assist"), null);
+});
+
+test("keeps a sidebar preview alive across a quick same-link re-entry", () => {
+  const runtime = createRuntime();
+  const link = runtime.addSidebarLink();
+  runtime.dispatchSettings({ sidebarPreview: true });
+  assert.ok(runtime.sidebarObserver());
+
+  runtime.dispatchDocumentEvent("pointerover", { target: link });
+  runtime.dispatchDocumentEvent("pointerout", {
+    clientX: 0,
+    clientY: 0,
+    relatedTarget: null,
+    target: link
+  });
+  assert.equal(runtime.pendingTimeouts(120), 1);
+  runtime.dispatchDocumentEvent("pointerover", { target: link });
+  assert.equal(runtime.pendingTimeouts(120), 0);
+
+  runtime.dispatchSettings({ sidebarPreview: false });
+  assert.equal(runtime.sidebarObserver(), undefined);
+  const disabledPointerOut = runtime.dispatchDocumentEvent("pointerout", {
+    relatedTarget: null,
+    target: link
+  });
+  assert.equal(disabledPointerOut.propagationStopped, undefined);
+});
+
+test("shows LIVE distance and only the contiguous buffered time ahead", () => {
+  const runtime = createRuntime();
+  const { controls } = runtime.addPlayer({
+    currentTime: 60,
+    seekable: [[0, 100]],
+    buffered: [
+      [0, 62],
+      [70, 90]
+    ]
+  });
+  runtime.dispatchSettings({ timelineAssist: false, videoLatency: true });
+  runtime.runIntervals(500);
+
+  const status = controls.querySelector(".cng-video-latency");
+  assert.ok(status);
+  assert.match(status.textContent, /LIVE까지 40\.0초/);
+  assert.match(status.textContent, /미리 받음 2\.0초/);
+});
+
 test("skips chat DOM work while every chat option is disabled", () => {
   const runtime = createRuntime();
+  const baseHundredMsIntervals = runtime.intervalCount(100);
 
   assert.equal(runtime.queryCount("[role='log']"), 0);
-  runtime.runInterval(3000);
-  assert.equal(runtime.queryCount("[role='log']"), 0);
+  assert.equal(runtime.chatObserverOptions(), null);
+  assert.equal(runtime.intervalCount(3000), 0);
   const queriesBeforeVerifier = runtime.totalDocumentQueryCount();
   runtime.runIntervals(100);
   assert.equal(runtime.totalDocumentQueryCount(), queriesBeforeVerifier);
 
+  runtime.dispatchSettings({ chatTimestamp: true });
   assert.deepEqual(runtime.chatObserverOptions(), {
     childList: true,
     subtree: true,
@@ -489,28 +963,25 @@ test("skips chat DOM work while every chat option is disabled", () => {
       "data-index",
       "data-key",
       "data-virtual-index",
-      "aria-posinset"
+      "aria-posinset",
+      "role"
     ]
   });
-
-  const addedNode = new runtime.FakeHTMLElement("span");
-  runtime.notifyChat([
-    {
-      addedNodes: [addedNode],
-      removedNodes: [],
-      target: runtime.chatLog,
-      type: "childList"
-    }
-  ]);
-  assert.equal(runtime.pendingTimeouts(50), 0);
-  assert.equal(runtime.queryCount("[role='log']"), 0);
-
-  runtime.dispatchSettings({ chatTimestamp: true });
+  assert.equal(runtime.intervalCount(3000), 1);
+  assert.equal(runtime.intervalCount(100), baseHundredMsIntervals + 1);
   assert.equal(runtime.pendingTimeouts(50), 1);
   runtime.flushTimeouts(50);
-
-  assert.equal(runtime.queryCount("[role='log']"), 1);
   assert.ok(runtime.timestamp());
+
+  runtime.dispatchSettings({ chatTimestamp: false });
+  assert.equal(runtime.chatObserverOptions(), null);
+  assert.equal(runtime.intervalCount(3000), 0);
+  assert.equal(runtime.intervalCount(100), baseHundredMsIntervals);
+
+  runtime.dispatchSettings({ restoreTransparentNicknames: true });
+  assert.ok(runtime.chatObserverOptions());
+  assert.equal(runtime.intervalCount(3000), 1);
+  assert.equal(runtime.intervalCount(100), baseHundredMsIntervals + 1);
 });
 
 test("removes an owned timestamp immediately when the last chat option turns off", () => {
@@ -537,6 +1008,8 @@ test("removes an owned timestamp immediately when the last chat option turns off
   assert.equal(runtime.timestamp(), null);
   assert.equal(runtime.pendingTimeouts(50), 0);
   assert.equal(runtime.queryCount("[role='log']"), scansBeforeDisable);
+  assert.equal(runtime.chatObserverOptions(), null);
+  assert.equal(runtime.intervalCount(3000), 0);
 });
 
 test("restores the new original when a blinded row is reused without a DOM rewrite", () => {
