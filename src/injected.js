@@ -18,6 +18,7 @@
   });
 
   const nativeJsonParse = JSON.parse;
+  const nativeUint8Array = globalThis.Uint8Array;
   const MESSAGE_SOURCE = "chzzk-ex";
   const { DEFAULT_SETTINGS } = config;
   const EVENT_TOKEN = String.fromCharCode(97, 100);
@@ -32,7 +33,11 @@
   const PRIMARY_MUTE_RESTORE_DELAY_MS = 500;
   const PRIMARY_UNMUTED_SNAPSHOT_DELAY_MS = 750;
   const USER_VOLUME_INTENT_WINDOW_MS = 1200;
+  const MAX_PROTECTED_PAYLOAD_BYTES = 2 * 1024 * 1024;
   const FILTER_PLAYBACK_RUNTIME = Symbol.for("chzzkfilter-playback");
+  const PROTECTED_BYTES_RUNTIME = Symbol.for("chzzk-ex-protected-bytes");
+  const PROTECTED_CRYPTO_RUNTIME = Symbol.for("chzzk-ex-protected-crypto");
+  const REJECTION_GUARD_RUNTIME = Symbol.for("chzzk-ex-rejection-guard");
   const ownsPlaybackTransport = !window[FILTER_PLAYBACK_RUNTIME];
   const KOREAN_EVENT_LABEL = String.fromCharCode(44305, 44256);
   const KOREAN_SKIP_LABEL = String.fromCharCode(49828, 53429);
@@ -69,32 +74,81 @@
   const pendingPrimarySnapshots = new WeakSet();
 
   function suppressPlaybackRejectionSignal() {
-    if (
-      Object.prototype.hasOwnProperty.call(
-        Object.prototype,
-        PLAYBACK_REJECTION_EVENT
-      )
-    ) {
+    if (globalThis[REJECTION_GUARD_RUNTIME]) {
       return;
     }
 
-    Object.defineProperty(Object.prototype, PLAYBACK_REJECTION_EVENT, {
-      configurable: true,
-      get() {
-        return undefined;
-      },
-      set(value) {
-        if (value !== PLAYBACK_REJECTION_EVENT) {
-          return;
-        }
+    const existingDescriptor = Object.getOwnPropertyDescriptor(
+      Object.prototype,
+      PLAYBACK_REJECTION_EVENT
+    );
+    if (!existingDescriptor || existingDescriptor.configurable) {
+      Object.defineProperty(Object.prototype, PLAYBACK_REJECTION_EVENT, {
+        configurable: true,
+        get() {
+          return undefined;
+        },
+        set(value) {
+          if (value !== PLAYBACK_REJECTION_EVENT) {
+            return;
+          }
 
-        Object.defineProperty(this, PLAYBACK_REJECTION_EVENT, {
-          value,
+          Object.defineProperty(this, PLAYBACK_REJECTION_EVENT, {
+            value,
+            configurable: true,
+            enumerable: true,
+            writable: true
+          });
+        }
+      });
+    }
+
+    const mapPrototype = globalThis.Map?.prototype;
+    const nativeMapGet = mapPrototype?.get;
+    const nativeMapSet = mapPrototype?.set;
+    if (typeof nativeMapGet === "function" && typeof nativeMapSet === "function") {
+      Object.defineProperties(mapPrototype, {
+        get: {
+          value: function guardedMapGet(key) {
+            if (key === PLAYBACK_REJECTION_EVENT) {
+              return [];
+            }
+            return nativeMapGet.apply(this, arguments);
+          },
           configurable: true,
-          enumerable: true,
           writable: true
-        });
-      }
+        },
+        set: {
+          value: function guardedMapSet(key) {
+            if (key === PLAYBACK_REJECTION_EVENT) {
+              return this;
+            }
+            return nativeMapSet.apply(this, arguments);
+          },
+          configurable: true,
+          writable: true
+        }
+      });
+    }
+
+    const eventTargetPrototype = globalThis.EventTarget?.prototype;
+    const nativeAddEventListener = eventTargetPrototype?.addEventListener;
+    if (typeof nativeAddEventListener === "function") {
+      Object.defineProperty(eventTargetPrototype, "addEventListener", {
+        value: function guardedAddEventListener(type) {
+          if (type === PLAYBACK_REJECTION_EVENT) {
+            return undefined;
+          }
+          return nativeAddEventListener.apply(this, arguments);
+        },
+        configurable: true,
+        writable: true
+      });
+    }
+
+    Object.defineProperty(globalThis, REJECTION_GUARD_RUNTIME, {
+      value: true,
+      configurable: false
     });
   }
 
@@ -226,6 +280,160 @@
     }
   }
 
+  function startsWithJsonObject(bytes) {
+    if (!bytes || bytes.byteLength === 0) {
+      return false;
+    }
+
+    let index = 0;
+    if (
+      bytes.byteLength >= 3 &&
+      bytes[0] === 0xef &&
+      bytes[1] === 0xbb &&
+      bytes[2] === 0xbf
+    ) {
+      index = 3;
+    }
+
+    while (
+      index < bytes.byteLength &&
+      (bytes[index] === 0x09 ||
+        bytes[index] === 0x0a ||
+        bytes[index] === 0x0d ||
+        bytes[index] === 0x20)
+    ) {
+      index += 1;
+    }
+
+    return bytes[index] === 0x7b;
+  }
+
+  function installProtectedByteRewrite() {
+    if (
+      globalThis[PROTECTED_BYTES_RUNTIME] ||
+      typeof nativeUint8Array !== "function" ||
+      typeof globalThis.TextDecoder !== "function" ||
+      typeof globalThis.TextEncoder !== "function"
+    ) {
+      return;
+    }
+
+    const decoder = new globalThis.TextDecoder("utf-8", { fatal: true });
+    const decode = globalThis.TextDecoder.prototype.decode;
+    const encoder = new globalThis.TextEncoder();
+
+    try {
+      const patchedUint8Array = new Proxy(nativeUint8Array, {
+        construct(target, args, newTarget) {
+          const bytes = Reflect.construct(target, args, newTarget);
+          if (
+            bytes.byteLength > MAX_PROTECTED_PAYLOAD_BYTES ||
+            !startsWithJsonObject(bytes)
+          ) {
+            return bytes;
+          }
+
+          try {
+            const text = decode.call(decoder, bytes);
+            const rewritten = rewriteJsonText(
+              text,
+              core.REQUEST_KIND.TUNNELED_API
+            );
+            if (rewritten === null) {
+              return bytes;
+            }
+
+            log("rewrote protected byte payload");
+            return Reflect.construct(target, [encoder.encode(rewritten)]);
+          } catch {
+            return bytes;
+          }
+        }
+      });
+
+      Object.defineProperty(globalThis, "Uint8Array", {
+        value: patchedUint8Array,
+        configurable: true,
+        writable: true
+      });
+      Object.defineProperty(globalThis, PROTECTED_BYTES_RUNTIME, {
+        value: true,
+        configurable: false
+      });
+    } catch (error) {
+      log("failed to install protected byte rewrite", error);
+    }
+  }
+
+  function installProtectedCryptoRewrite() {
+    const subtle = globalThis.crypto?.subtle;
+    const subtlePrototype =
+      globalThis.SubtleCrypto?.prototype ||
+      (subtle ? Object.getPrototypeOf(subtle) : null);
+    const nativeDecrypt = subtlePrototype?.decrypt;
+
+    if (
+      globalThis[PROTECTED_CRYPTO_RUNTIME] ||
+      typeof nativeDecrypt !== "function" ||
+      typeof nativeUint8Array !== "function" ||
+      typeof globalThis.TextDecoder !== "function" ||
+      typeof globalThis.TextEncoder !== "function"
+    ) {
+      return;
+    }
+
+    const decoder = new globalThis.TextDecoder("utf-8", { fatal: true });
+    const decode = globalThis.TextDecoder.prototype.decode;
+    const encoder = new globalThis.TextEncoder();
+
+    try {
+      Object.defineProperty(subtlePrototype, "decrypt", {
+        value: function patchedDecrypt(algorithm) {
+          const result = nativeDecrypt.apply(this, arguments);
+          const algorithmName =
+            typeof algorithm === "string" ? algorithm : algorithm?.name;
+          if (String(algorithmName || "").toUpperCase() !== "AES-GCM") {
+            return result;
+          }
+
+          return Promise.resolve(result).then((buffer) => {
+            const bytes = new nativeUint8Array(buffer);
+            if (
+              bytes.byteLength > MAX_PROTECTED_PAYLOAD_BYTES ||
+              !startsWithJsonObject(bytes)
+            ) {
+              return buffer;
+            }
+
+            try {
+              const text = decode.call(decoder, bytes);
+              const rewritten = rewriteJsonText(
+                text,
+                core.REQUEST_KIND.TUNNELED_API
+              );
+              if (rewritten === null) {
+                return buffer;
+              }
+
+              log("rewrote authenticated response");
+              return encoder.encode(rewritten).buffer;
+            } catch {
+              return buffer;
+            }
+          });
+        },
+        configurable: true,
+        writable: true
+      });
+      Object.defineProperty(globalThis, PROTECTED_CRYPTO_RUNTIME, {
+        value: true,
+        configurable: false
+      });
+    } catch (error) {
+      log("failed to install authenticated response rewrite", error);
+    }
+  }
+
   const textDecoderPrototype = globalThis.TextDecoder?.prototype;
   const nativeTextDecoderDecode = textDecoderPrototype?.decode;
 
@@ -242,6 +450,9 @@
       writable: true
     });
   }
+
+  installProtectedCryptoRewrite();
+  installProtectedByteRewrite();
 
   function isProtectedTunnelDecoder(decoder) {
     return (
@@ -791,7 +1002,8 @@
   window.postMessage(
     {
       source: MESSAGE_SOURCE,
-      type: "ready"
+      type: "ready",
+      settingsDefaults: DEFAULT_SETTINGS
     },
     "*"
   );

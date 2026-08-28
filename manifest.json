@@ -3,7 +3,7 @@
   "name": "CHZZK EX",
   "short_name": "CHZZK EX",
   "description": "Playback, navigation, and chat conveniences for CHZZK.",
-  "version": "1.0.12",
+  "version": "1.0.13",
   "permissions": [
     "declarativeNetRequest",
     "storage"
@@ -21,7 +21,6 @@
         "https://*.chzzk.naver.com/*"
       ],
       "js": [
-        "src/settings.js",
         "src/content.js"
       ],
       "run_at": "document_start"

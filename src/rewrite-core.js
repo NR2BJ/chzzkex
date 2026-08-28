@@ -35,8 +35,27 @@
     control: `${EVENT_TOKEN}ControlType`,
     display: `player${EVENT_TITLE_TOKEN}DisplayResponse`,
     prePhase: ["pre", "Roll"].join(""),
-    midPhase: ["mid", "Roll"].join("")
+    midPhase: ["mid", "Roll"].join(""),
+    scheduleId: `video${EVENT_TITLE_TOKEN}ScheduleId`,
+    breaks: `${EVENT_TOKEN}Breaks`,
+    unitId: `${EVENT_TOKEN}UnitId`,
+    sources: `${EVENT_TOKEN}Sources`,
+    items: `${EVENT_TOKEN}s`
   });
+  const SCHEDULE_DESCRIPTION = [
+    "GFP",
+    "Video",
+    EVENT_TITLE_TOKEN,
+    "Schedule"
+  ].join(" ");
+  const WATERFALL_DESCRIPTION = ["Naver", "SSP", "Waterfall", "List"].join(" ");
+  const REALTIME_EVENT_COMMAND = 93006;
+  const REALTIME_PLAYBACK_EVENT = [
+    "LIVE",
+    "MID",
+    "ROLL",
+    EVENT_TOKEN.toUpperCase()
+  ].join("_");
   const DISPLAY_STATUS_PATTERN = new RegExp(
     `/service/v[\\d.]+/${EVENT_TOKEN}/display-status/?$`
   );
@@ -236,7 +255,24 @@
     return value;
   }
 
+  function sanitizeRealtimePlaybackEvent(value) {
+    const event =
+      isObject(value) && Number(value.cmd) === REALTIME_EVENT_COMMAND
+        ? value.bdy
+        : value;
+
+    if (!isObject(event) || event.type !== REALTIME_PLAYBACK_EVENT) {
+      return value;
+    }
+
+    event[RUNTIME_FIELDS.count] = 0;
+    return value;
+  }
+
   function sanitizeParsedPayload(value) {
+    sanitizeRealtimePlaybackEvent(value);
+    sanitizeProtectedPayload(value);
+
     if (isObject(value) && isObject(value.content)) {
       const content = value.content;
       const hasRuntimeState = Object.prototype.hasOwnProperty.call(
@@ -261,6 +297,47 @@
     }
 
     return sanitizeParsedPlayback(value);
+  }
+
+  function hasEnvelopeDescription(payload, description) {
+    return (
+      isObject(payload) &&
+      isObject(payload.head) &&
+      payload.head.version === "0.0.1" &&
+      payload.head.description === description
+    );
+  }
+
+  function sanitizeProtectedPayload(payload) {
+    if (
+      hasEnvelopeDescription(payload, SCHEDULE_DESCRIPTION) &&
+      typeof payload.requestId === "string" &&
+      typeof payload[RUNTIME_FIELDS.scheduleId] === "string" &&
+      Array.isArray(payload[RUNTIME_FIELDS.breaks])
+    ) {
+      payload[RUNTIME_FIELDS.breaks] = [
+        {
+          id: "",
+          startDelay: 0,
+          preFetch: 0,
+          [RUNTIME_FIELDS.unitId]: "",
+          [RUNTIME_FIELDS.sources]: []
+        }
+      ];
+      return payload;
+    }
+
+    if (
+      hasEnvelopeDescription(payload, WATERFALL_DESCRIPTION) &&
+      typeof payload.requestId === "string" &&
+      isObject(payload.eventTracking) &&
+      typeof payload[RUNTIME_FIELDS.unitId] === "string" &&
+      Array.isArray(payload[RUNTIME_FIELDS.items])
+    ) {
+      payload[RUNTIME_FIELDS.items] = [];
+    }
+
+    return payload;
   }
 
   function sanitizePlaybackBootstrap(payload, requestKind) {
@@ -344,6 +421,8 @@
   }
 
   function sanitizeTunneledPayload(payload) {
+    sanitizeProtectedPayload(payload);
+
     if (!isObject(payload) || !isObject(payload.content)) {
       return payload;
     }
@@ -434,6 +513,7 @@
     rewritePayload,
     sanitizeParsedPayload,
     sanitizeParsedPlayback,
+    sanitizeProtectedPayload,
     shouldRewrite,
     shouldShortCircuit,
     syntheticPayload

@@ -1,6 +1,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 const config = require("../src/settings.js");
+const manifest = require("../manifest.json");
 
 test("keeps one complete immutable settings definition", () => {
   assert.deepEqual(Object.keys(config.DEFAULT_SETTINGS), [
@@ -49,4 +50,25 @@ test("keeps one complete immutable settings definition", () => {
     "NORMALIZATION_TARGET_RANGE",
     "COMPRESSOR_PRESETS"
   ]);
+});
+
+test("loads shared modules only in the page world", () => {
+  const scriptWorlds = new Map();
+
+  for (const entry of manifest.content_scripts) {
+    const world = entry.world || "ISOLATED";
+    for (const script of entry.js || []) {
+      const worlds = scriptWorlds.get(script) || [];
+      worlds.push(world);
+      scriptWorlds.set(script, worlds);
+    }
+  }
+
+  for (const [script, worlds] of scriptWorlds) {
+    assert.equal(
+      new Set(worlds).size,
+      1,
+      `${script} must not be deduplicated across extension worlds`
+    );
+  }
 });

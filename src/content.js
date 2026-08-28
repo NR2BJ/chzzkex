@@ -1,15 +1,9 @@
 (() => {
-  const config = globalThis.__CHZZK_EX_CONFIG__;
-  if (!config) {
-    console.error("[CHZZK EX] settings were not loaded");
-    return;
-  }
-
   const MESSAGE_SOURCE = "chzzk-ex";
-  const { DEFAULT_SETTINGS } = config;
 
   const storage = chrome.storage;
-  let statePromise = storageGet(DEFAULT_SETTINGS);
+  let settingsDefaults = null;
+  let statePromise = Promise.resolve({});
   storage.local.remove([
     "playbackFilter",
     "directPlayback",
@@ -27,10 +21,18 @@
     });
   }
 
-  async function postSettings() {
+  async function postSettings(defaults) {
+    if (defaults && typeof defaults === "object") {
+      settingsDefaults = { ...defaults };
+    }
+    if (!settingsDefaults) {
+      return;
+    }
+
+    statePromise = storageGet(settingsDefaults);
     const state = await statePromise;
     const settings = {};
-    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+    for (const key of Object.keys(settingsDefaults)) {
       settings[key] = state[key];
     }
     window.postMessage(
@@ -48,7 +50,7 @@
       return;
     }
     if (event.data.type === "ready") {
-      postSettings();
+      postSettings(event.data.settingsDefaults);
     }
   });
 
@@ -57,15 +59,16 @@
       return;
     }
 
-    const changedSettings = Object.keys(DEFAULT_SETTINGS).some((key) =>
+    if (!settingsDefaults) {
+      return;
+    }
+
+    const changedSettings = Object.keys(settingsDefaults).some((key) =>
       Object.prototype.hasOwnProperty.call(changes, key)
     );
 
     if (changedSettings) {
-      statePromise = storageGet(DEFAULT_SETTINGS);
       postSettings();
     }
   });
-
-  postSettings();
 })();

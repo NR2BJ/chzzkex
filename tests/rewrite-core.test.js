@@ -2,6 +2,8 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const core = require("../src/rewrite-core.js");
 const EVENT_TOKEN = String.fromCharCode(97, 100);
+const EVENT_TITLE_TOKEN =
+  EVENT_TOKEN[0].toUpperCase() + EVENT_TOKEN.slice(1);
 const CONNECTION_TOKEN = String.fromCharCode(112, 50, 112);
 const FIELDS = core.RUNTIME_FIELDS;
 const CONNECTION_FIELDS = Object.freeze({
@@ -203,6 +205,42 @@ test("normalizes a parsed live payload even when its request route was missed", 
   assert.equal(rewritten.content[FIELDS.bootstrap], true);
 });
 
+test("neutralizes realtime playback start notifications", () => {
+  const eventType = ["LIVE", "MID", "ROLL", EVENT_TOKEN.toUpperCase()].join("_");
+  const frame = {
+    cmd: 93006,
+    bdy: {
+      type: eventType,
+      id: "event-id",
+      event: "START",
+      ts: 123,
+      [FIELDS.count]: 2,
+      [FIELDS.control]: "STUDIO_CONTROL"
+    }
+  };
+
+  const rewritten = core.sanitizeParsedPayload(frame);
+
+  assert.equal(rewritten.bdy[FIELDS.count], 0);
+  assert.equal(rewritten.bdy.event, "START");
+  assert.equal(rewritten.bdy.id, "event-id");
+});
+
+test("leaves unrelated realtime notifications unchanged", () => {
+  const frame = {
+    cmd: 93006,
+    bdy: {
+      type: "CHANGE_CHAT_MODE",
+      [FIELDS.count]: 2
+    }
+  };
+  const before = JSON.stringify(frame);
+
+  core.sanitizeParsedPayload(frame);
+
+  assert.equal(JSON.stringify(frame), before);
+});
+
 test("rejects an untrusted direct playback host", () => {
   const encoded = Buffer.from(
     "https://pstatic.net.example.test/channel/1080p/playlist.m3u8"
@@ -248,6 +286,83 @@ test("rewrites tunneled playback decisions by response shape", () => {
     [FIELDS.prePhase]: false,
     [FIELDS.midPhase]: false
   });
+});
+
+test("replaces a protected playback schedule with an inactive schedule", () => {
+  const payload = {
+    head: {
+      version: "0.0.1",
+      description: ["GFP", "Video", EVENT_TITLE_TOKEN, "Schedule"].join(" ")
+    },
+    requestId: "vas-12345678-1234-1234-9234-123456789abc",
+    [FIELDS.scheduleId]: "LIVE_CHZZK_NDP_SCH",
+    [FIELDS.breaks]: [
+      {
+        id: "MID-0",
+        startDelay: 0,
+        preFetch: 0,
+        [FIELDS.unitId]: "w_live_chzzk_naver_va_mid",
+        [FIELDS.sources]: [{ id: "MID-0-0", withRemindAd: 0 }]
+      }
+    ]
+  };
+
+  const rewritten = core.rewritePayload(core.REQUEST_KIND.TUNNELED_API, payload);
+
+  assert.equal(rewritten.requestId, payload.requestId);
+  assert.equal(rewritten[FIELDS.scheduleId], "LIVE_CHZZK_NDP_SCH");
+  assert.deepEqual(rewritten[FIELDS.breaks], [
+    {
+      id: "",
+      startDelay: 0,
+      preFetch: 0,
+      [FIELDS.unitId]: "",
+      [FIELDS.sources]: []
+    }
+  ]);
+});
+
+test("removes items from a protected waterfall response", () => {
+  const payload = {
+    requestId: "0123456789abcdef0123456789abcdef",
+    head: {
+      version: "0.0.1",
+      description: "Naver SSP Waterfall List"
+    },
+    eventTracking: {
+      completions: [{ url: "https://example.test/complete" }]
+    },
+    [FIELDS.unitId]: "w_live_chzzk_naver_va_mid",
+    [FIELDS.items]: [
+      {
+        encrypted: "payload",
+        adProviderName: "provider",
+        adUrl: "https://example.test/media"
+      }
+    ]
+  };
+
+  const rewritten = core.sanitizeParsedPayload(payload);
+
+  assert.deepEqual(rewritten[FIELDS.items], []);
+  assert.deepEqual(rewritten.eventTracking, payload.eventTracking);
+});
+
+test("leaves unrelated versioned envelopes unchanged", () => {
+  const payload = {
+    head: {
+      version: "0.0.2",
+      description: ["GFP", "Video", EVENT_TITLE_TOKEN, "Schedule"].join(" ")
+    },
+    requestId: "vas-future",
+    [FIELDS.scheduleId]: "LIVE_CHZZK_NDP_SCH",
+    [FIELDS.breaks]: [{ [FIELDS.sources]: [{ id: "future" }] }]
+  };
+
+  const before = JSON.stringify(payload);
+  core.sanitizeProtectedPayload(payload);
+
+  assert.equal(JSON.stringify(payload), before);
 });
 
 test("rewrites tunneled playback bootstrap data without replacing tracks", () => {

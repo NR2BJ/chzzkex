@@ -16,7 +16,7 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const distDir = path.join(rootDir, "dist");
 const stageDir = path.join(distDir, ".stage");
 const runtimeEntries = ["NOTICE.md", "popup", "rules", "src"];
-const contentBundleSources = ["src/settings.js", "src/content.js"];
+const contentBundleSources = ["src/content.js"];
 const mainBundleSources = [
   "src/settings.js",
   "src/rewrite-core.js",

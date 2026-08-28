@@ -1,5 +1,4 @@
 html.chzzk-ex-playback-active .chzzk-ex-auxiliary {
   visibility: hidden !important;
-  opacity: 0 !important;
   pointer-events: none !important;
 }

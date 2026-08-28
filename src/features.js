@@ -2356,5 +2356,12 @@
     document.addEventListener("readystatechange", start, { once: true });
   }
 
-  window.postMessage({ source: MESSAGE_SOURCE, type: "ready" }, "*");
+  window.postMessage(
+    {
+      source: MESSAGE_SOURCE,
+      type: "ready",
+      settingsDefaults: DEFAULT_SETTINGS
+    },
+    "*"
+  );
 })();

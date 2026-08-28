@@ -14,6 +14,9 @@ const EVENT_FIELDS = Object.freeze({
   ].join(""),
   state: String.fromCharCode(100, 97, 98)
 });
+const EVENT_TOKEN = String.fromCharCode(97, 100);
+const EVENT_TITLE_TOKEN =
+  EVENT_TOKEN[0].toUpperCase() + EVENT_TOKEN.slice(1);
 const CONNECTION_TOKEN = String.fromCharCode(112, 50, 112);
 const scripts = ["src/settings.js", "src/rewrite-core.js", "src/injected.js"].map(
   (file) => fs.readFileSync(path.join(root, file), "utf8")
@@ -43,6 +46,7 @@ function createRuntime(options = {}) {
   const listeners = new Map();
   const documentListeners = new Map();
   const fetchCalls = [];
+  const subtleDecryptCalls = [];
   const intervalCallbacks = [];
   const timeoutCallbacks = [];
   const videos = [];
@@ -59,6 +63,29 @@ function createRuntime(options = {}) {
 
   class FakeMutationObserver {
     observe() {}
+  }
+
+  class FakeEventTarget {
+    constructor() {
+      this.listeners = [];
+    }
+
+    addEventListener(type, listener) {
+      this.listeners.push({ type, listener });
+    }
+  }
+
+  class FakeSubtleCrypto {
+    decrypt(algorithm, key, data) {
+      subtleDecryptCalls.push({ algorithm, key, data });
+      if (data instanceof ArrayBuffer) {
+        return Promise.resolve(data.slice(0));
+      }
+
+      return Promise.resolve(
+        data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength)
+      );
+    }
   }
 
   class FakeTextDecoder extends TextDecoder {}
@@ -174,12 +201,16 @@ function createRuntime(options = {}) {
 
   const context = {
     AbortController,
+    crypto: { subtle: new FakeSubtleCrypto() },
+    EventTarget: FakeEventTarget,
     Headers,
     HTMLVideoElement: FakeVideoElement,
     MutationObserver: FakeMutationObserver,
     Request,
     Response,
+    SubtleCrypto: FakeSubtleCrypto,
     TextDecoder: FakeTextDecoder,
+    TextEncoder,
     URL,
     XMLHttpRequest: FakeXhr,
     atob,
@@ -261,6 +292,7 @@ function createRuntime(options = {}) {
     nativeFetch,
     nativeXhrOpen,
     nativeXhrSend,
+    subtleDecryptCalls,
     noticeCloseClicks() {
       return noticeCloseClicks;
     }
@@ -349,6 +381,28 @@ test("suppresses only the playback rejection listener slot", () => {
   assert.equal(result.enumOwn, true);
   assert.equal(result.listenerValue, undefined);
   assert.equal(result.listenerOwn, false);
+});
+
+test("suppresses the rejection signal across alternate listener stores", () => {
+  const runtime = createRuntime();
+  const result = vm.runInContext(
+    `(() => {
+      const eventName = ["AD", "NOT", "DISPLAYED"].join("_");
+      const listenerMap = new Map();
+      listenerMap.set(eventName, [() => {}]);
+      const target = new EventTarget();
+      target.addEventListener(eventName, () => {});
+      target.addEventListener("ordinary", () => {});
+      return {
+        mappedListeners: listenerMap.get(eventName).length,
+        storedTypes: target.listeners.map((entry) => entry.type)
+      };
+    })()`,
+    runtime.context
+  );
+
+  assert.equal(result.mappedListeners, 0);
+  assert.deepEqual(Array.from(result.storedTypes), ["ordinary"]);
 });
 
 test("advances auxiliary playback after the player settles once", () => {
@@ -631,6 +685,160 @@ test("rewrites only decoded protected tunnel payloads", () => {
   assert.equal(rewrittenPlayback.media[0].encodingTrack[0].encodingTrackId, "1080p");
 });
 
+test("rewrites protected schedules when the player creates transport bytes", () => {
+  const runtime = createRuntime();
+  const schedule = {
+    head: {
+      version: "0.0.1",
+      description: ["GFP", "Video", EVENT_TITLE_TOKEN, "Schedule"].join(" ")
+    },
+    requestId: "vas-12345678-1234-1234-9234-123456789abc",
+    [`video${EVENT_TITLE_TOKEN}ScheduleId`]: "LIVE_CHZZK_NDP_SCH",
+    [`${EVENT_TOKEN}Breaks`]: [
+      {
+        id: "MID-0",
+        startDelay: 0,
+        preFetch: 0,
+        [`${EVENT_TOKEN}UnitId`]: "w_live_chzzk_naver_va_mid",
+        [`${EVENT_TOKEN}Sources`]: [{ id: "MID-0-0", withRemindAd: 0 }]
+      }
+    ]
+  };
+  runtime.context.protectedBytes = Array.from(
+    new TextEncoder().encode(JSON.stringify(schedule))
+  );
+
+  const rewrittenBytes = vm.runInContext(
+    "Array.from(new Uint8Array(protectedBytes))",
+    runtime.context
+  );
+  const rewritten = JSON.parse(
+    new TextDecoder().decode(Uint8Array.from(rewrittenBytes))
+  );
+
+  assert.equal(rewritten.requestId, schedule.requestId);
+  assert.deepEqual(rewritten[`${EVENT_TOKEN}Breaks`], [
+    {
+      id: "",
+      startDelay: 0,
+      preFetch: 0,
+      [`${EVENT_TOKEN}UnitId`]: "",
+      [`${EVENT_TOKEN}Sources`]: []
+    }
+  ]);
+});
+
+test("rewrites authenticated tunnel plaintext immediately after decrypt", async () => {
+  const runtime = createRuntime();
+  const schedule = {
+    head: {
+      version: "0.0.1",
+      description: ["GFP", "Video", EVENT_TITLE_TOKEN, "Schedule"].join(" ")
+    },
+    requestId: "vas-12345678-1234-1234-9234-123456789abc",
+    [`video${EVENT_TITLE_TOKEN}ScheduleId`]: "LIVE_CHZZK_NDP_SCH",
+    [`${EVENT_TOKEN}Breaks`]: [
+      {
+        id: "MID-0",
+        [`${EVENT_TOKEN}UnitId`]: "w_live_chzzk_naver_va_mid",
+        [`${EVENT_TOKEN}Sources`]: [{ id: "MID-0-0" }]
+      }
+    ]
+  };
+  const source = new TextEncoder().encode(JSON.stringify(schedule)).buffer;
+
+  const rewrittenBuffer = await runtime.context.crypto.subtle.decrypt(
+    { name: "AES-GCM" },
+    {},
+    source
+  );
+  const rewritten = JSON.parse(
+    new TextDecoder().decode(new Uint8Array(rewrittenBuffer))
+  );
+
+  assert.equal(runtime.subtleDecryptCalls.length, 1);
+  assert.deepEqual(rewritten[`${EVENT_TOKEN}Breaks`], [
+    {
+      id: "",
+      startDelay: 0,
+      preFetch: 0,
+      [`${EVENT_TOKEN}UnitId`]: "",
+      [`${EVENT_TOKEN}Sources`]: []
+    }
+  ]);
+});
+
+test("leaves unrelated crypto algorithms and plaintext unchanged", async () => {
+  const runtime = createRuntime();
+  const sourceText = JSON.stringify({ purpose: "ordinary" });
+  const source = new TextEncoder().encode(sourceText).buffer;
+
+  const cbcBuffer = await runtime.context.crypto.subtle.decrypt(
+    { name: "AES-CBC" },
+    {},
+    source
+  );
+  const gcmBuffer = await runtime.context.crypto.subtle.decrypt(
+    { name: "AES-GCM" },
+    {},
+    source
+  );
+
+  assert.equal(new TextDecoder().decode(new Uint8Array(cbcBuffer)), sourceText);
+  assert.equal(new TextDecoder().decode(new Uint8Array(gcmBuffer)), sourceText);
+});
+
+test("rewrites protected waterfall bytes before playback consumes them", () => {
+  const runtime = createRuntime();
+  const waterfall = {
+    requestId: "0123456789abcdef0123456789abcdef",
+    head: {
+      version: "0.0.1",
+      description: "Naver SSP Waterfall List"
+    },
+    eventTracking: {
+      completions: [{ url: "https://example.test/complete" }]
+    },
+    [`${EVENT_TOKEN}UnitId`]: "w_live_chzzk_naver_va_mid",
+    [`${EVENT_TOKEN}s`]: [{ encrypted: "payload" }]
+  };
+  runtime.context.protectedBytes = Array.from(
+    new TextEncoder().encode(`\n${JSON.stringify(waterfall)}`)
+  );
+
+  const rewrittenBytes = vm.runInContext(
+    "Array.from(new Uint8Array(protectedBytes))",
+    runtime.context
+  );
+  const rewritten = JSON.parse(
+    new TextDecoder().decode(Uint8Array.from(rewrittenBytes))
+  );
+
+  assert.deepEqual(rewritten[`${EVENT_TOKEN}s`], []);
+  assert.equal(rewritten.requestId, waterfall.requestId);
+});
+
+test("preserves unrelated typed-array construction", () => {
+  const runtime = createRuntime();
+  const source = new TextEncoder().encode(
+    JSON.stringify({ head: { version: "0.0.1", description: "ordinary" } })
+  );
+  runtime.context.protectedBytes = Array.from(source);
+
+  const result = vm.runInContext(
+    `({
+      bytes: Array.from(new Uint8Array(protectedBytes)),
+      instance: new Uint8Array(1) instanceof Uint8Array,
+      width: Uint8Array.BYTES_PER_ELEMENT
+    })`,
+    runtime.context
+  );
+
+  assert.deepEqual(Array.from(result.bytes), Array.from(source));
+  assert.equal(result.instance, true);
+  assert.equal(result.width, 1);
+});
+
 test("preserves opaque tunnel responses byte-for-byte", async () => {
   const runtime = createRuntime();
   const response = await runtime.context.fetch(
@@ -652,4 +860,11 @@ test("does not dismiss the playback notice automatically", () => {
   }
 
   assert.equal(runtime.noticeCloseClicks(), 0);
+});
+
+test("keeps auxiliary containers measurable for the current player guard", () => {
+  const css = fs.readFileSync(path.join(root, "src/playback.css"), "utf8");
+
+  assert.match(css, /visibility:\s*hidden/);
+  assert.doesNotMatch(css, /opacity:\s*0/);
 });
