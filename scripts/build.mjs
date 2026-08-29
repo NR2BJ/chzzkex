@@ -118,7 +118,7 @@ async function makeArchive(sourceDir, archivePath) {
     );
   }
 
-  if (windowsArchivePath !== archivePath) {
+  if (process.platform === "win32" && windowsArchivePath !== archivePath) {
     await rename(windowsArchivePath, archivePath);
   }
 }
