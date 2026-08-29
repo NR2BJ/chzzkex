@@ -74,51 +74,6 @@ test("seeks a newly started live video close to the current seekable edge", () =
   assert.equal(core.initialLiveSeekTarget(10, 10, 10), null);
 });
 
-test("measures buffered playback only in the range containing the playhead", () => {
-  const ranges = {
-    length: 2,
-    start(index) {
-      return [0, 70][index];
-    },
-    end(index) {
-      return [62, 90][index];
-    }
-  };
-
-  assert.equal(core.bufferedAhead(ranges, 60), 2);
-  assert.equal(core.bufferedAhead(ranges, 65), 0);
-  assert.equal(core.bufferedAhead(ranges, 70), 20);
-  assert.equal(core.bufferedAhead(null, 60), 0);
-  assert.equal(core.bufferedAhead(ranges, Number.NaN), 0);
-});
-
-test("recognizes only a genuinely visible native timeline", () => {
-  assert.equal(
-    core.hasUsableNativeTimeline([
-      { display: "none", visibility: "visible", width: 0, height: 0 }
-    ]),
-    false
-  );
-  assert.equal(
-    core.hasUsableNativeTimeline([
-      { display: "block", visibility: "visible", width: 800, height: 14 }
-    ]),
-    true
-  );
-  assert.equal(
-    core.hasUsableNativeTimeline([
-      {
-        custom: true,
-        display: "grid",
-        visibility: "visible",
-        width: 800,
-        height: 26
-      }
-    ]),
-    false
-  );
-});
-
 test("gated loudness ignores silence and quiet outliers", () => {
   const blocks = [-60, -20, -20, -21].map(core.energyFromLoudnessDb);
   const loudnessDb = core.gatedLoudnessDb(blocks);
@@ -126,16 +81,7 @@ test("gated loudness ignores silence and quiet outliers", () => {
   assert.equal(core.gatedLoudnessDb([]), null);
 });
 
-test("normalization gain uses the louder target and configurable boost cap", () => {
-  assert.equal(core.normalizationGainDb({ loudnessDb: -30 }), 12);
-  assert.equal(core.normalizationGainDb({ loudnessDb: -30, maximumDb: 3 }), 3);
-  assert.equal(core.normalizationGainDb({ loudnessDb: -40, maximumDb: 60 }), 26);
-  assert.equal(core.normalizationGainDb({ loudnessDb: -4 }), -10);
-  assert.equal(core.normalizationGainDb({ loudnessDb: 0 }), -14);
-  assert.equal(core.normalizationGainDb({ loudnessDb: -14 }), 0);
-});
-
-test("hybrid normalization combines integrated, short-term, and peak limits", () => {
+test("hybrid normalization follows loud parts with average and peak guards", () => {
   assert.deepEqual(
     core.hybridNormalizationGainDb({
       integratedLoudnessDb: -30,
@@ -144,44 +90,61 @@ test("hybrid normalization combines integrated, short-term, and peak limits", ()
     }),
     {
       gainDb: 3,
-      integratedGainDb: 14,
-      shortTermLimitDb: 6,
+      integratedGuardDb: 16,
+      loudPartGainDb: 6,
       peakLimitDb: 3,
       effectiveMaximumDb: 12
     }
   );
   assert.equal(
     core.hybridNormalizationGainDb({
-      integratedLoudnessDb: -16,
-      shortTermLoudnessDb: -12,
-      peakDb: -3
+      integratedLoudnessDb: -22,
+      shortTermLoudnessDb: -18,
+      peakDb: -10
     }).gainDb,
-    0
+    6
   );
   assert.equal(
     core.hybridNormalizationGainDb({
-      integratedLoudnessDb: -11,
-      shortTermLoudnessDb: -8,
+      integratedLoudnessDb: -16,
+      shortTermLoudnessDb: -18,
+      peakDb: -10
+    }).gainDb,
+    2
+  );
+  assert.equal(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -20,
+      shortTermLoudnessDb: -16,
       peakDb: -1
     }).gainDb,
-    -5
+    -2
   );
   assert.equal(
     core.hybridNormalizationGainDb({
-      integratedLoudnessDb: -24,
-      shortTermLoudnessDb: -20,
-      peakDb: -12
+      integratedLoudnessDb: -30,
+      shortTermLoudnessDb: -30,
+      peakDb: -10
     }).gainDb,
-    8
+    7
   );
   assert.equal(
     core.hybridNormalizationGainDb({
       integratedLoudnessDb: -32,
-      shortTermLoudnessDb: -30,
+      shortTermLoudnessDb: Number.NEGATIVE_INFINITY,
       peakDb: -20,
       anchorConfirmed: false
     }).gainDb,
     6
+  );
+  assert.equal(
+    core.hybridNormalizationGainDb({
+      integratedLoudnessDb: -22,
+      shortTermLoudnessDb: -20,
+      peakDb: -10,
+      targetDb: -20
+    }).gainDb,
+    4
   );
   assert.equal(
     core.hybridNormalizationGainDb({
@@ -192,68 +155,6 @@ test("hybrid normalization combines integrated, short-term, and peak limits", ()
       anchorConfirmed: false
     }).gainDb,
     3
-  );
-  assert.equal(
-    core.hybridNormalizationGainDb({
-      integratedLoudnessDb: -22,
-      shortTermLoudnessDb: -20,
-      peakDb: -10,
-      targetDb: -20
-    }).gainDb,
-    2
-  );
-  assert.equal(
-    core.hybridNormalizationGainDb({
-      integratedLoudnessDb: -5,
-      shortTermLoudnessDb: -3,
-      peakDb: -1,
-      targetDb: -24
-    }).gainDb,
-    -19
-  );
-  assert.equal(
-    core.hybridNormalizationGainDb({
-      integratedLoudnessDb: -5,
-      shortTermLoudnessDb: -3,
-      peakDb: -1,
-      targetDb: -60
-    }).gainDb,
-    -55
-  );
-});
-
-test("normalization confirms a useful anchor by level, contrast, or peak", () => {
-  assert.equal(
-    core.normalizationAnchorConfirmed({
-      shortTermLoudnessDb: -23,
-      medianLoudnessDb: -25,
-      peakDb: -18
-    }),
-    true
-  );
-  assert.equal(
-    core.normalizationAnchorConfirmed({
-      shortTermLoudnessDb: -27,
-      medianLoudnessDb: -34,
-      peakDb: -18
-    }),
-    true
-  );
-  assert.equal(
-    core.normalizationAnchorConfirmed({
-      shortTermLoudnessDb: -30,
-      medianLoudnessDb: -30,
-      peakDb: -10
-    }),
-    true
-  );
-  assert.equal(
-    core.normalizationAnchorConfirmed({
-      shortTermLoudnessDb: -30,
-      medianLoudnessDb: -31,
-      peakDb: -18
-    }),
-    false
   );
 });
 
@@ -278,6 +179,19 @@ test("compressor threshold follows player volume before source correction", () =
       0.001
   );
   assert.equal(core.compressorThresholdForMediaVolume(-18, 0), -78);
+});
+
+test("compressor trim preserves linear player-volume changes", () => {
+  assert.equal(core.compressorVolumeCompensationDb(-18, 3, 1), 0);
+  assert.ok(
+    Math.abs(core.compressorVolumeCompensationDb(-18, 3, 0.5) - -2.40824) <
+      0.0001
+  );
+  assert.ok(
+    Math.abs(core.compressorVolumeCompensationDb(-18, 3, 0.1) - -8) <
+      0.0001
+  );
+  assert.equal(core.compressorVolumeCompensationDb(-18, 1, 0.5), 0);
 });
 
 test("reads only the current 400ms tail from analyser buffers", () => {
@@ -342,53 +256,33 @@ test("adaptive loudness uses the complete relative-gated programme", () => {
   );
 });
 
-test("short-term safety only lowers the long-term gain ceiling", () => {
+test("short-term safety reacts to sustained loudness without peak pumping", () => {
   assert.equal(
     core.normalizationSafetyCeilingDb({
-      shortTermLoudnessDb: -24,
-      renderedPeakDb: -18
+      shortTermLoudnessDb: -24
     }),
     12
   );
   assert.equal(
     core.normalizationSafetyCeilingDb({
       shortTermLoudnessDb: -24,
-      renderedPeakDb: -18,
       maximumDb: 30
     }),
     13
   );
   assert.equal(
     core.normalizationSafetyCeilingDb({
-      shortTermLoudnessDb: -10,
-      renderedPeakDb: -18
+      shortTermLoudnessDb: -10
     }),
     -1
   );
   assert.equal(
     core.normalizationSafetyCeilingDb({
-      shortTermLoudnessDb: -24,
-      renderedPeakDb: -12
-    }),
-    9
-  );
-  assert.equal(
-    core.normalizationSafetyCeilingDb({
-      shortTermLoudnessDb: -24,
-      renderedPeakDb: -1
-    }),
-    0
-  );
-  assert.equal(
-    core.normalizationSafetyCeilingDb({
       shortTermLoudnessDb: -3,
-      renderedPeakDb: -1,
       shortTermCeilingDb: -20
     }),
     -17
   );
-  assert.ok(Math.abs(core.maximumPeakDb([0, 0.25, 0.5]) + 6.0206) < 0.001);
-  assert.equal(core.maximumPeakDb([]), Number.NEGATIVE_INFINITY);
 });
 
 test("converts the K-weighting high-pass Q to the Web Audio dB unit", () => {
@@ -403,6 +297,10 @@ test("adaptive gain ignores small changes and lowers faster than it raises", () 
   assert.equal(core.stepAdaptiveGainDb(2, 4), 2.25);
   assert.equal(core.stepAdaptiveGainDb(2, -2), 1);
   assert.equal(core.stepAdaptiveGainDb(2, 1.4), 2);
+  assert.equal(
+    core.stepAdaptiveGainDb(2, 4, { increaseStepDb: 0.5 }),
+    2.5
+  );
 });
 
 test("reports the player-selected latency mode without changing it", () => {

@@ -11,12 +11,15 @@ const scripts = ["src/settings.js", "src/feature-core.js", "src/features.js"].ma
     source: fs.readFileSync(path.join(root, file), "utf8")
   })
 );
+const featureCss = fs.readFileSync(path.join(root, "src/features.css"), "utf8");
 const BLIND_PLACEHOLDER = "메시지가 블라인드 처리되었습니다.";
 
 function createRuntime({
   message,
   renderedText = "hello",
   nativeHidden,
+  sessionStorageState = new Map(),
+  dateNow = Date.now(),
   nicknameStyle = {
     color: "rgb(20, 21, 23)",
     backgroundImage: "none",
@@ -31,8 +34,28 @@ function createRuntime({
   const windowListeners = new Map();
   let nextTimerId = 1;
   let nowMs = 0;
+  let currentDateNow = dateNow;
   let currentNicknameStyle = nicknameStyle;
   let nicknameStyleReads = 0;
+  const sessionStorage = {
+    get length() {
+      return sessionStorageState.size;
+    },
+    getItem(key) {
+      return sessionStorageState.has(String(key))
+        ? sessionStorageState.get(String(key))
+        : null;
+    },
+    key(index) {
+      return Array.from(sessionStorageState.keys())[index] ?? null;
+    },
+    removeItem(key) {
+      sessionStorageState.delete(String(key));
+    },
+    setItem(key, value) {
+      sessionStorageState.set(String(key), String(value));
+    }
+  };
 
   function dataName(attribute) {
     return attribute
@@ -338,6 +361,12 @@ function createRuntime({
     }
   }
 
+  class RuntimeDate extends Date {
+    static now() {
+      return currentDateNow;
+    }
+  }
+
   const document = {
     visibilityState: "visible",
     addEventListener(type, listener) {
@@ -414,6 +443,7 @@ function createRuntime({
       }
     },
     console,
+    Date: RuntimeDate,
     document,
     HTMLElement: FakeHTMLElement,
     HTMLMediaElement: {
@@ -427,6 +457,7 @@ function createRuntime({
     },
     MutationObserver: FakeMutationObserver,
     performance: { now: () => nowMs },
+    sessionStorage,
     getComputedStyle(element) {
       if (element === nickname) {
         nicknameStyleReads += 1;
@@ -562,6 +593,12 @@ function createRuntime({
     return payload;
   }
 
+  function dispatchWindowEvent(type, event = {}) {
+    for (const listener of windowListeners.get(type) || []) {
+      listener(event);
+    }
+  }
+
   function chatObserver() {
     return mutationObservers.find((observer) => observer.target === document.body);
   }
@@ -628,6 +665,7 @@ function createRuntime({
     },
     dispatchSettings,
     dispatchDocumentEvent,
+    dispatchWindowEvent,
     document,
     flushTimeouts,
     item,
@@ -650,6 +688,9 @@ function createRuntime({
     },
     runInterval,
     runIntervals,
+    setDateNow(value) {
+      currentDateNow = value;
+    },
     setNow(value) {
       nowMs = value;
     },
@@ -664,6 +705,7 @@ function createRuntime({
       context.location.href = `https://chzzk.naver.com${pathname}`;
     },
     setMessage,
+    sessionStorageState,
     timestamp() {
       return item.querySelector(".cng-chat-timestamp");
     },
@@ -676,17 +718,111 @@ function createRuntime({
   };
 }
 
-test("restores the fallback timeline when a native slider disappears", () => {
+function mountTimeline(runtime) {
+  runtime.runIntervals(250);
+}
+
+test("keeps one custom timeline when CHZZK mounts its paywalled native slider", () => {
   const runtime = createRuntime();
   const { nativeSlider, player } = runtime.addPlayer({ nativeTimeline: true });
   runtime.dispatchSettings({ timelineAssist: true });
+  mountTimeline(runtime);
 
-  runtime.runIntervals(250);
-  assert.equal(player.querySelector(".cng-timeline-assist"), null);
-
-  nativeSlider.remove();
-  runtime.runIntervals(250);
+  assert.ok(nativeSlider.isConnected);
   assert.ok(player.querySelector(".cng-timeline-assist"));
+});
+
+test("uses one stable offset and a separate live button in the fallback timeline", () => {
+  const runtime = createRuntime();
+  const { player, video } = runtime.addPlayer({ currentTime: 99.5 });
+  runtime.dispatchSettings({ timelineAssist: true });
+  mountTimeline(runtime);
+
+  const timeline = player.querySelector(".cng-timeline-assist");
+  const position = timeline.querySelector(".cng-timeline-assist__position");
+  const live = timeline.querySelector(".cng-timeline-assist__live");
+  const track = timeline.querySelector(".cng-timeline-assist__track");
+  assert.ok(timeline);
+  assert.equal(timeline.getAttribute("role"), null);
+  assert.equal(timeline.querySelector(".cng-timeline-assist__start"), null);
+  assert.equal(position.textContent, "-00:00");
+  assert.equal(live.tagName, "BUTTON");
+  assert.equal(live.getAttribute("type"), "button");
+  assert.equal(track.getAttribute("role"), "slider");
+
+  const untouchedTime = video.currentTime;
+  const blankPointer = runtime.dispatchDocumentEvent("pointerdown", {
+    button: 0,
+    clientX: 50,
+    isTrusted: true,
+    pointerId: 9,
+    target: timeline
+  });
+  assert.equal(blankPointer.defaultPrevented, undefined);
+  assert.equal(video.currentTime, untouchedTime);
+
+  const positionWrites = position.textWriteCount;
+  runtime.setNow(1500);
+  video.currentTime = 96;
+  runtime.runIntervals(250);
+  assert.equal(position.textContent, "-00:00");
+  assert.equal(position.textWriteCount, positionWrites);
+  assert.equal(track.getAttribute("aria-valuenow"), "0");
+  assert.equal(track.getAttribute("aria-valuetext"), "실시간");
+
+  runtime.dispatchDocumentEvent("pointerdown", {
+    button: 0,
+    clientX: 25,
+    isTrusted: true,
+    pointerId: 10,
+    target: track
+  });
+  runtime.dispatchDocumentEvent("pointerup", {
+    clientX: 25,
+    isTrusted: true,
+    pointerId: 10,
+    target: track
+  });
+  video.currentTime = 99.4;
+  runtime.runIntervals(250);
+  assert.equal(position.textContent, "-00:01");
+  assert.equal(track.getAttribute("aria-valuenow"), "-1");
+  assert.equal(track.getAttribute("aria-valuetext"), "실시간 1초 전");
+});
+
+test("keeps custom timeline interaction and layout rules separated", () => {
+  assert.match(
+    featureCss,
+    /\.cng-timeline-assist\s*\{[^}]*grid-template-columns:\s*8ch 1fr auto;[^}]*pointer-events:\s*none;/s
+  );
+  assert.match(
+    featureCss,
+    /\.cng-timeline-assist__position\s*\{[^}]*width:\s*8ch;[^}]*font-variant-numeric:\s*tabular-nums;/s
+  );
+  assert.match(
+    featureCss,
+    /\.cng-timeline-assist__track\s*\{[^}]*pointer-events:\s*auto;/s
+  );
+  assert.match(
+    featureCss,
+    /\.cng-timeline-assist__live\s*\{[^}]*pointer-events:\s*auto;/s
+  );
+  assert.match(
+    featureCss,
+    /\.pzp-pc:not\(\.pzp-pc--controls\)[^}]*\.cng-timeline-assist\s*\{[^}]*visibility:\s*hidden;/s
+  );
+  assert.match(
+    featureCss,
+    /\.pzp-pc\.pzp-pc--fullscreen[^}]*\.cng-timeline-assist\s*\{[^}]*bottom:\s*70px;/s
+  );
+  assert.match(
+    featureCss,
+    /\.pzp-pc:has\(\.cng-timeline-assist\)[^}]*\.pzp-pc-progress-slider,[^}]*\.pzp-pc__bottom-buttons\s*>\s*\.slider\s*\{[^}]*display:\s*none\s*!important;/s
+  );
+  assert.match(
+    featureCss,
+    /\[role="tooltip"\]:has\(a\[href\*="\/profile#cheat_key"\]\)\s*\{[^}]*display:\s*none\s*!important;/s
+  );
 });
 
 test("protects trusted native timeline seeks from initial live synchronization", () => {
@@ -783,23 +919,62 @@ test("keeps a native seek made after an SPA URL change before the next tick", ()
   assert.equal(video.currentTime, 40);
 });
 
-test("treats external seeking and focused-player keys as restore intent", () => {
+test("does not treat startup media seeking as a manual rewind", () => {
   const seekingRuntime = createRuntime();
-  const seekingPlayer = seekingRuntime.addPlayer({
-    currentTime: 50,
-    nativeTimeline: true
+  const seekingPlayer = seekingRuntime.addPlayer({ currentTime: 97 });
+  seekingRuntime.dispatchSettings({
+    timelineAssist: true,
+    videoLatency: true
   });
-  seekingRuntime.dispatchSettings({ timelineAssist: true });
   seekingRuntime.setNow(100);
   seekingRuntime.runIntervals(250);
-  seekingPlayer.video.currentTime = 40;
   seekingRuntime.dispatchDocumentEvent("seeking", {
+    isTrusted: true,
     target: seekingPlayer.video
   });
   seekingRuntime.setNow(1000);
   seekingRuntime.runIntervals(250);
-  assert.equal(seekingPlayer.video.currentTime, 40);
+  assert.equal(seekingPlayer.video.currentTime, 99.75);
 
+  seekingRuntime.dispatchDocumentEvent("seeking", {
+    isTrusted: true,
+    target: seekingPlayer.video
+  });
+  seekingRuntime.setNow(1101);
+  seekingRuntime.runIntervals(250);
+  const timeline = seekingPlayer.player.querySelector(".cng-timeline-assist");
+  assert.ok(timeline);
+  assert.equal(timeline.classList.contains("is-live"), true);
+  seekingRuntime.runIntervals(500);
+  assert.equal(
+    seekingPlayer.controls.querySelector(".cng-video-latency").textContent,
+    "지연 0.3초 · 음량 꺼짐"
+  );
+});
+
+test("keeps watching until the startup seekable edge finishes hydrating", () => {
+  const runtime = createRuntime();
+  const seekable = [[0, 100]];
+  const { video } = runtime.addPlayer({
+    currentTime: 99.5,
+    nativeTimeline: true,
+    seekable
+  });
+  runtime.dispatchSettings({ timelineAssist: true });
+  runtime.setNow(100);
+  runtime.runIntervals(250);
+  runtime.setNow(700);
+  runtime.runIntervals(250);
+  assert.equal(video.currentTime, 99.5);
+
+  seekable[0][1] = 103;
+  video.currentTime = 100;
+  runtime.setNow(1000);
+  runtime.runIntervals(250);
+  assert.equal(video.currentTime, 102.75);
+});
+
+test("treats focused-player seek keys as restore intent", () => {
   for (const { focusedTarget, key } of [
     { focusedTarget: "video", key: "j" },
     { focusedTarget: "player", key: "L" },
@@ -848,16 +1023,19 @@ test("does not treat the initial LIVE synchronization write as user seeking", ()
   runtime.runIntervals(500);
   const status = controls.querySelector(".cng-video-latency");
   assert.ok(status);
-  assert.match(status.textContent, /지연 0\.3초/);
-  assert.doesNotMatch(status.textContent, /LIVE까지/);
+  assert.equal(status.textContent, "지연 0.3초 · 음량 꺼짐");
+  assert.doesNotMatch(status.textContent, /자동|LIVE까지|미리 받음/);
+  assert.equal(status.textContent.match(/\d+(?:\.\d+)?초/g)?.length, 1);
 });
 
 test("cancels a custom timeline drag without a final seek", () => {
   const runtime = createRuntime();
   const { player, video } = runtime.addPlayer({ currentTime: 99.5 });
   runtime.dispatchSettings({ timelineAssist: true });
-  runtime.runIntervals(250);
-  const slider = player.querySelector(".cng-timeline-assist");
+  mountTimeline(runtime);
+  const timeline = player.querySelector(".cng-timeline-assist");
+  const slider = timeline.querySelector(".cng-timeline-assist__track");
+  assert.ok(timeline);
   assert.ok(slider);
 
   runtime.dispatchDocumentEvent("pointerdown", {
@@ -895,6 +1073,198 @@ test("cancels a custom timeline drag without a final seek", () => {
   assert.equal(player.querySelector(".cng-timeline-assist"), null);
 });
 
+test("cancels a custom timeline drag when the route or video changes", () => {
+  const routeRuntime = createRuntime();
+  const routePlayer = routeRuntime.addPlayer({ currentTime: 99.5 });
+  routeRuntime.dispatchSettings({ timelineAssist: true });
+  mountTimeline(routeRuntime);
+  const routeTrack = routePlayer.player.querySelector(
+    ".cng-timeline-assist__track"
+  );
+  routeRuntime.dispatchDocumentEvent("pointerdown", {
+    button: 0,
+    clientX: 25,
+    isTrusted: true,
+    pointerId: 3,
+    target: routeTrack
+  });
+  assert.equal(routePlayer.video.currentTime, 25);
+  routeRuntime.setLocation("/live/channel-b");
+  routeRuntime.dispatchDocumentEvent("pointermove", {
+    clientX: 80,
+    isTrusted: true,
+    pointerId: 3,
+    target: routeTrack
+  });
+  routeRuntime.dispatchDocumentEvent("pointerup", {
+    clientX: 80,
+    isTrusted: true,
+    pointerId: 3,
+    target: routeTrack
+  });
+  assert.equal(routePlayer.video.currentTime, 25);
+
+  const videoRuntime = createRuntime();
+  const oldPlayer = videoRuntime.addPlayer({ currentTime: 99.5 });
+  videoRuntime.dispatchSettings({ timelineAssist: true });
+  mountTimeline(videoRuntime);
+  const oldTrack = oldPlayer.player.querySelector(
+    ".cng-timeline-assist__track"
+  );
+  videoRuntime.dispatchDocumentEvent("pointerdown", {
+    button: 0,
+    clientX: 25,
+    isTrusted: true,
+    pointerId: 4,
+    target: oldTrack
+  });
+  oldPlayer.player.remove();
+  const nextPlayer = videoRuntime.addPlayer({ currentTime: 60 });
+  videoRuntime.dispatchDocumentEvent("pointermove", {
+    clientX: 80,
+    isTrusted: true,
+    pointerId: 4,
+    target: oldTrack
+  });
+  videoRuntime.dispatchDocumentEvent("pointerup", {
+    clientX: 80,
+    isTrusted: true,
+    pointerId: 4,
+    target: oldTrack
+  });
+  assert.equal(nextPlayer.video.currentTime, 60);
+});
+
+test("keeps LIVE seeks inside a very short seekable range", () => {
+  const runtime = createRuntime();
+  const { player, video } = runtime.addPlayer({
+    currentTime: 100,
+    seekable: [[100, 100.1]],
+    buffered: [[100, 100.1]]
+  });
+  runtime.dispatchSettings({ timelineAssist: true });
+  mountTimeline(runtime);
+  const live = player.querySelector(".cng-timeline-assist__live");
+  runtime.dispatchDocumentEvent("click", { isTrusted: true, target: live });
+  assert.equal(video.currentTime, 100);
+});
+
+test("a LIVE button or End cancels an active rewind drag", () => {
+  for (const action of ["button", "End"]) {
+    const runtime = createRuntime();
+    const { player, video } = runtime.addPlayer({ currentTime: 99.5 });
+    runtime.dispatchSettings({ timelineAssist: true });
+    mountTimeline(runtime);
+    const timeline = player.querySelector(".cng-timeline-assist");
+    const track = timeline.querySelector(".cng-timeline-assist__track");
+    runtime.dispatchDocumentEvent("pointerdown", {
+      button: 0,
+      clientX: 25,
+      isTrusted: true,
+      pointerId: 5,
+      target: track
+    });
+    assert.equal(video.currentTime, 25);
+
+    if (action === "button") {
+      runtime.dispatchDocumentEvent("click", {
+        isTrusted: true,
+        target: timeline.querySelector(".cng-timeline-assist__live")
+      });
+    } else {
+      runtime.dispatchDocumentEvent("keydown", {
+        isTrusted: true,
+        key: "End",
+        target: track
+      });
+    }
+    assert.equal(video.currentTime, 99.75, action);
+
+    runtime.dispatchDocumentEvent("pointerup", {
+      clientX: 10,
+      isTrusted: true,
+      pointerId: 5,
+      target: track
+    });
+    assert.equal(video.currentTime, 99.75, action);
+  }
+});
+
+test("returns to LIVE from the button, right edge, and End without restoring manual seek", () => {
+  for (const action of ["button", "right-edge", "End"]) {
+    const runtime = createRuntime();
+    const { controls, player, video } = runtime.addPlayer({ currentTime: 99.5 });
+    runtime.dispatchSettings({ timelineAssist: true, videoLatency: true });
+    mountTimeline(runtime);
+
+    const timeline = player.querySelector(".cng-timeline-assist");
+    const track = timeline.querySelector(".cng-timeline-assist__track");
+    runtime.dispatchDocumentEvent("pointerdown", {
+      button: 0,
+      clientX: 25,
+      isTrusted: true,
+      pointerId: 1,
+      target: track
+    });
+    runtime.dispatchDocumentEvent("pointerup", {
+      clientX: 25,
+      isTrusted: true,
+      pointerId: 1,
+      target: track
+    });
+    runtime.dispatchDocumentEvent("seeking", { target: video });
+    assert.equal(video.currentTime, 25);
+
+    if (action === "button") {
+      runtime.dispatchDocumentEvent("click", {
+        isTrusted: true,
+        target: timeline.querySelector(".cng-timeline-assist__live")
+      });
+    } else if (action === "right-edge") {
+      runtime.dispatchDocumentEvent("pointerdown", {
+        button: 0,
+        clientX: 100,
+        isTrusted: true,
+        pointerId: 2,
+        target: track
+      });
+      runtime.dispatchDocumentEvent("pointerup", {
+        clientX: 100,
+        isTrusted: true,
+        pointerId: 2,
+        target: track
+      });
+    } else {
+      runtime.dispatchDocumentEvent("keydown", {
+        isTrusted: true,
+        key: "End",
+        target: track
+      });
+    }
+
+    assert.equal(video.currentTime, 99.75, action);
+    runtime.dispatchDocumentEvent("seeking", { target: video });
+    runtime.setNow(1500);
+    runtime.runIntervals(250);
+    assert.equal(
+      timeline.querySelector(".cng-timeline-assist__position").textContent,
+      "-00:00",
+      action
+    );
+    assert.equal(timeline.classList.contains("is-live"), true, action);
+
+    runtime.runIntervals(500);
+    const status = controls.querySelector(".cng-video-latency");
+    assert.equal(status.textContent, "지연 0.3초 · 음량 꺼짐", action);
+    assert.doesNotMatch(status.textContent, /자동|LIVE까지|미리 받음/, action);
+    assert.equal(
+      status.textContent.match(/\d+(?:\.\d+)?초/g)?.length,
+      1,
+      action
+    );
+  }
+});
+
 test("keeps a sidebar preview alive across a quick same-link re-entry", () => {
   const runtime = createRuntime();
   const link = runtime.addSidebarLink();
@@ -921,7 +1291,7 @@ test("keeps a sidebar preview alive across a quick same-link re-entry", () => {
   assert.equal(disabledPointerOut.propagationStopped, undefined);
 });
 
-test("shows LIVE distance and only the contiguous buffered time ahead", () => {
+test("leaves rewind distance to the fallback timeline", () => {
   const runtime = createRuntime();
   const { controls } = runtime.addPlayer({
     currentTime: 60,
@@ -936,8 +1306,8 @@ test("shows LIVE distance and only the contiguous buffered time ahead", () => {
 
   const status = controls.querySelector(".cng-video-latency");
   assert.ok(status);
-  assert.match(status.textContent, /LIVE까지 40\.0초/);
-  assert.match(status.textContent, /미리 받음 2\.0초/);
+  assert.equal(status.textContent, "음량 꺼짐");
+  assert.doesNotMatch(status.textContent, /지연|LIVE까지|미리 받음|\d+(?:\.\d+)?초/);
 });
 
 test("skips chat DOM work while every chat option is disabled", () => {
@@ -1120,6 +1490,697 @@ test("does not restore a NORMAL message that quotes a blind notice", () => {
   assert.equal(runtime.messageElement.dataset.cngBlindedRestored, undefined);
 });
 
+test("restores an exact native notice when React still reports NORMAL", () => {
+  const runtime = createRuntime({
+    message: {
+      key: "stale-normal-message",
+      time: new Date(2026, 7, 29, 12, 0, 0).getTime(),
+      user: "tester",
+      status: "NORMAL",
+      content: "recoverable original",
+      originalContent: "recoverable original",
+      profile: { nickname: "tester" }
+    },
+    renderedText: BLIND_PLACEHOLDER,
+    nativeHidden: true
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  runtime.flushTimeouts(50);
+
+  assert.equal(runtime.messageElement.textContent, "recoverable original");
+  assert.equal(
+    runtime.messageElement.dataset.cngBlindedRestored,
+    "stale-normal-message"
+  );
+});
+
+test("uses content when originalContent contains only the blind notice", () => {
+  const runtime = createRuntime({
+    message: {
+      key: "placeholder-original-content",
+      time: new Date(2026, 7, 29, 12, 0, 0).getTime(),
+      user: "tester",
+      status: "BLIND",
+      content: {
+        props: {
+          children: ["content ", { props: { children: "fallback" } }]
+        }
+      },
+      originalContent: BLIND_PLACEHOLDER,
+      profile: { nickname: "tester" }
+    },
+    renderedText: BLIND_PLACEHOLDER
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  runtime.flushTimeouts(50);
+
+  assert.equal(runtime.messageElement.textContent, "content fallback");
+  assert.equal(
+    runtime.messageElement.dataset.cngBlindedRestored,
+    "placeholder-original-content"
+  );
+});
+
+test("uses a cached original when a later blind update contains only notices", () => {
+  const time = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const runtime = createRuntime({
+    message: {
+      key: "cached-message",
+      time,
+      user: "tester",
+      status: "NORMAL",
+      content: "cached original",
+      originalContent: "cached original",
+      profile: { nickname: "tester" }
+    },
+    renderedText: "cached original"
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  runtime.flushTimeouts(50);
+
+  runtime.setMessage({
+    key: "recreated-message-key",
+    time,
+    user: "tester",
+    status: "BLIND",
+    content: BLIND_PLACEHOLDER,
+    originalContent: BLIND_PLACEHOLDER,
+    profile: { nickname: "tester" }
+  });
+  runtime.messageElement.className = "_text_test _is_hidden_test";
+  runtime.messageElement.textContent = BLIND_PLACEHOLDER;
+  runtime.runInterval(3000);
+
+  assert.equal(runtime.messageElement.textContent, "cached original");
+  assert.equal(
+    runtime.messageElement.dataset.cngBlindedRestored,
+    "recreated-message-key"
+  );
+});
+
+test("restores a live NORMAL message immediately when the same key becomes HIDDEN", () => {
+  const time = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const runtime = createRuntime({
+    message: {
+      key: "live-transition-key",
+      time,
+      user: "tester",
+      status: "NORMAL",
+      content: "visible before moderation",
+      originalContent: "visible before moderation",
+      profile: { nickname: "tester" }
+    },
+    renderedText: "visible before moderation"
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+
+  runtime.setMessage({
+    key: "live-transition-key",
+    time,
+    user: "tester",
+    status: "HIDDEN",
+    content: "",
+    originalContent: "",
+    profile: { nickname: "tester" }
+  });
+  runtime.messageElement.className = "_text_test _is_hidden_test";
+  runtime.messageElement.textContent = BLIND_PLACEHOLDER;
+  runtime.notifyChat([
+    {
+      addedNodes: [],
+      removedNodes: [],
+      target: runtime.messageElement,
+      type: "characterData"
+    }
+  ]);
+
+  assert.equal(runtime.pendingTimeouts(50), 1);
+  runtime.flushTimeouts(50);
+  assert.equal(runtime.messageElement.textContent, "visible before moderation");
+  assert.equal(
+    runtime.messageElement.dataset.cngBlindedRestored,
+    "live-transition-key"
+  );
+});
+
+test("restores every current CHZZK notiBlind status while its spread update keeps the original", () => {
+  for (const status of [
+    "BLIND",
+    "HIDDEN",
+    "RECLAIM",
+    "FILTERED",
+    "CBOTBLIND"
+  ]) {
+    const original = `visible before ${status}`;
+    const visibleMessage = {
+      key: `noti-blind-${status}`,
+      time: new Date(2026, 7, 29, 12, 0, 0).getTime(),
+      user: "noti-blind-user",
+      status: "NORMAL",
+      content: original,
+      originalContent: original,
+      profile: { nickname: "tester" }
+    };
+    const runtime = createRuntime({
+      message: visibleMessage,
+      renderedText: original
+    });
+    runtime.dispatchSettings({ restoreBlindedMessages: true });
+
+    // CHZZK's current notiBlindListener replaces the list entry with
+    // `{ ...previousMessage, status: blindType }` for every non-CANCEL event.
+    runtime.setMessage({ ...visibleMessage, status });
+    runtime.messageElement.className = "_text_test _is_hidden_test";
+    runtime.messageElement.textContent = BLIND_PLACEHOLDER;
+    runtime.notifyChat([
+      {
+        addedNodes: [],
+        removedNodes: [],
+        target: runtime.messageElement,
+        type: "characterData"
+      }
+    ]);
+    runtime.flushTimeouts(50);
+
+    assert.equal(runtime.messageElement.textContent, original, status);
+    assert.equal(
+      runtime.messageElement.dataset.cngBlindedRestored,
+      visibleMessage.key,
+      status
+    );
+  }
+});
+
+test("persists a visible original on pagehide before the save timer fires", () => {
+  const sessionStorageState = new Map();
+  const time = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const visibleRuntime = createRuntime({
+    message: {
+      key: "pagehide-visible-key",
+      time,
+      user: "tester",
+      status: "NORMAL",
+      content: "saved during pagehide",
+      originalContent: "saved during pagehide",
+      profile: { nickname: "tester" }
+    },
+    renderedText: "saved during pagehide",
+    sessionStorageState
+  });
+  visibleRuntime.dispatchSettings({ restoreBlindedMessages: true });
+  assert.equal(visibleRuntime.pendingTimeouts(250), 1);
+
+  visibleRuntime.dispatchWindowEvent("pagehide");
+  assert.equal(sessionStorageState.size, 1);
+
+  const hiddenRuntime = createRuntime({
+    message: {
+      key: "pagehide-hidden-key",
+      time,
+      user: "tester",
+      status: "HIDDEN",
+      content: "",
+      originalContent: "",
+      profile: { nickname: "tester" }
+    },
+    renderedText: BLIND_PLACEHOLDER,
+    sessionStorageState
+  });
+  hiddenRuntime.dispatchSettings({ restoreBlindedMessages: true });
+
+  assert.equal(hiddenRuntime.messageElement.textContent, "saved during pagehide");
+});
+
+test("restores from the tab cache after the page runtime is recreated", () => {
+  const sessionStorageState = new Map();
+  const time = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const visibleRuntime = createRuntime({
+    message: {
+      key: "visible-message-key",
+      time,
+      user: "tester",
+      status: "NORMAL",
+      content: "original before reload",
+      originalContent: "original before reload",
+      profile: { nickname: "tester" }
+    },
+    renderedText: "original before reload",
+    sessionStorageState
+  });
+  visibleRuntime.dispatchSettings({ restoreBlindedMessages: true });
+  assert.equal(visibleRuntime.pendingTimeouts(250), 1);
+  visibleRuntime.setMessage({
+    key: "second-visible-message-key",
+    time: time + 1,
+    user: "tester",
+    status: "NORMAL",
+    content: "second original",
+    originalContent: "second original",
+    profile: { nickname: "tester" }
+  });
+  visibleRuntime.runInterval(3000);
+  assert.equal(visibleRuntime.pendingTimeouts(250), 1);
+  visibleRuntime.flushTimeouts(250);
+  assert.equal(sessionStorageState.size, 1);
+
+  const hiddenRuntime = createRuntime({
+    message: {
+      key: "hidden-message-key",
+      time,
+      user: "tester",
+      status: "HIDDEN",
+      content: "",
+      originalContent: "",
+      profile: { nickname: "tester" }
+    },
+    renderedText: BLIND_PLACEHOLDER,
+    sessionStorageState
+  });
+  hiddenRuntime.dispatchSettings({ restoreBlindedMessages: true });
+
+  assert.equal(hiddenRuntime.messageElement.textContent, "original before reload");
+  assert.equal(
+    hiddenRuntime.messageElement.dataset.cngBlindedRestored,
+    "hidden-message-key"
+  );
+
+  hiddenRuntime.dispatchSettings({ restoreBlindedMessages: false });
+  assert.equal(sessionStorageState.size, 0);
+});
+
+test("does not renew a cache entry merely because a HIDDEN row stays mounted", () => {
+  const now = 2_000_000_000_000;
+  const seenAt = now - 5 * 60 * 60 * 1000;
+  const time = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const storageKey = "__chzzk_ex_blind_cache_v1__:channel";
+  const sessionStorageState = new Map([
+    [
+      storageKey,
+      JSON.stringify({
+        savedAt: seenAt,
+        exact: [],
+        stable: [[`tester:${time}`, "cached without renewal", seenAt]]
+      })
+    ]
+  ]);
+  const runtime = createRuntime({
+    dateNow: now,
+    message: {
+      key: "hidden-cache-key",
+      time,
+      user: "tester",
+      status: "HIDDEN",
+      content: "",
+      originalContent: "",
+      profile: { nickname: "tester" }
+    },
+    renderedText: BLIND_PLACEHOLDER,
+    sessionStorageState
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+
+  assert.equal(runtime.messageElement.textContent, "cached without renewal");
+  assert.equal(runtime.pendingTimeouts(250), 0);
+  runtime.runInterval(3000);
+  runtime.runInterval(3000);
+  assert.equal(runtime.pendingTimeouts(250), 0);
+  assert.equal(
+    JSON.parse(sessionStorageState.get(storageKey)).stable[0][2],
+    seenAt
+  );
+
+  runtime.setDateNow(seenAt + 6 * 60 * 60 * 1000 + 1);
+  runtime.runInterval(3000);
+  assert.equal(runtime.messageElement.textContent, BLIND_PLACEHOLDER);
+  assert.equal(runtime.messageElement.dataset.cngBlindedRestored, undefined);
+  assert.equal(
+    runtime.messageElement.classList.contains("cng-restored-message"),
+    false
+  );
+  runtime.flushTimeouts(250);
+  assert.equal(sessionStorageState.has(storageKey), false);
+});
+
+test("persists the refreshed seen time after a directly visible row remains for a minute", () => {
+  const now = 2_000_000_000_000;
+  const time = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const storageKey = "__chzzk_ex_blind_cache_v1__:channel";
+  const runtime = createRuntime({
+    dateNow: now,
+    message: {
+      key: "visible-refresh-key",
+      time,
+      user: "tester",
+      status: "NORMAL",
+      content: "still visible",
+      originalContent: "still visible",
+      profile: { nickname: "tester" }
+    },
+    renderedText: "still visible"
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  runtime.flushTimeouts(250);
+  assert.equal(
+    JSON.parse(runtime.sessionStorageState.get(storageKey)).exact[0][2],
+    now
+  );
+
+  runtime.setDateNow(now + 60 * 1000);
+  runtime.runInterval(3000);
+  assert.equal(runtime.pendingTimeouts(250), 1);
+  runtime.flushTimeouts(250);
+  assert.equal(
+    JSON.parse(runtime.sessionStorageState.get(storageKey)).exact[0][2],
+    now + 60 * 1000
+  );
+});
+
+test("turning restoration off clears every channel cache and restored UI", () => {
+  const now = 2_000_000_000_000;
+  const time = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const currentKey = "__chzzk_ex_blind_cache_v1__:channel";
+  const previousKey = "__chzzk_ex_blind_cache_v1__:previous-channel";
+  const sessionStorageState = new Map([
+    [
+      currentKey,
+      JSON.stringify({
+        savedAt: now,
+        exact: [],
+        stable: [[`tester:${time}`, "current cached original", now]]
+      })
+    ],
+    [
+      previousKey,
+      JSON.stringify({
+        savedAt: now,
+        exact: [["previous-key", "previous cached original", now]],
+        stable: []
+      })
+    ],
+    ["unrelated-page-state", "keep me"]
+  ]);
+  const runtime = createRuntime({
+    dateNow: now,
+    message: {
+      key: "current-hidden-key",
+      time,
+      user: "tester",
+      status: "HIDDEN",
+      content: "",
+      originalContent: "",
+      profile: { nickname: "tester" }
+    },
+    renderedText: BLIND_PLACEHOLDER,
+    sessionStorageState
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  assert.equal(runtime.messageElement.textContent, "current cached original");
+
+  runtime.dispatchSettings({ restoreBlindedMessages: false });
+  assert.deepEqual(Array.from(sessionStorageState.entries()), [
+    ["unrelated-page-state", "keep me"]
+  ]);
+  assert.equal(runtime.messageElement.textContent, BLIND_PLACEHOLDER);
+  assert.equal(runtime.messageElement.dataset.cngBlindedRestored, undefined);
+  assert.equal(
+    runtime.messageElement.classList.contains("cng-restored-message"),
+    false
+  );
+
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  assert.equal(runtime.messageElement.textContent, BLIND_PLACEHOLDER);
+  assert.equal(runtime.messageElement.dataset.cngBlindedRestored, undefined);
+});
+
+test("does not copy stale chat rows into the next SPA channel cache", () => {
+  const now = 2_000_000_000_000;
+  const firstTime = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const runtime = createRuntime({
+    dateNow: now,
+    message: {
+      key: "channel-a-key",
+      time: firstTime,
+      user: "channel-a-user",
+      status: "NORMAL",
+      content: "channel A original",
+      originalContent: "channel A original",
+      profile: { nickname: "channel-a-user" }
+    },
+    renderedText: "channel A original"
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  runtime.flushTimeouts(250);
+
+  runtime.setLocation("/live/channel-b");
+  runtime.setMessage({
+    key: "channel-a-moderated-key",
+    time: firstTime,
+    user: "channel-a-user",
+    status: "BLIND",
+    content: BLIND_PLACEHOLDER,
+    originalContent: "channel A original",
+    profile: { nickname: "channel-a-user" }
+  });
+  runtime.messageElement.className = "_text_test _is_hidden_test";
+  runtime.messageElement.textContent = BLIND_PLACEHOLDER;
+  runtime.runInterval(3000);
+  runtime.runInterval(3000);
+  runtime.flushTimeouts(250);
+  const channelBKey = "__chzzk_ex_blind_cache_v1__:channel-b";
+  assert.equal(runtime.sessionStorageState.has(channelBKey), false);
+
+  runtime.setMessage({
+    key: "channel-b-key",
+    time: firstTime + 1000,
+    user: "channel-b-user",
+    status: "NORMAL",
+    content: "channel B original",
+    originalContent: "channel B original",
+    profile: { nickname: "channel-b-user" }
+  });
+  runtime.messageElement.textContent = "channel B original";
+  runtime.runInterval(3000);
+  runtime.flushTimeouts(250);
+
+  const channelBPayload = runtime.sessionStorageState.get(channelBKey);
+  assert.match(channelBPayload, /channel B original/);
+  assert.doesNotMatch(channelBPayload, /channel A original/);
+});
+
+test("caches the next SPA channel when its DOM updates before route detection", () => {
+  const now = 2_000_000_000_000;
+  const firstTime = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const runtime = createRuntime({
+    dateNow: now,
+    message: {
+      key: "early-channel-a-key",
+      time: firstTime,
+      user: "channel-a-user",
+      status: "NORMAL",
+      content: "early channel A original",
+      originalContent: "early channel A original",
+      profile: { nickname: "channel-a-user" }
+    },
+    renderedText: "early channel A original"
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  runtime.flushTimeouts(250);
+
+  runtime.setLocation("/live/early-channel-b");
+  runtime.setMessage({
+    key: "early-channel-a-key",
+    time: firstTime + 1000,
+    user: "channel-b-user",
+    status: "NORMAL",
+    content: "early channel B original",
+    originalContent: "early channel B original",
+    profile: { nickname: "channel-b-user" }
+  });
+  runtime.messageElement.textContent = "early channel B original";
+  runtime.runInterval(3000);
+  runtime.flushTimeouts(250);
+
+  const channelBKey =
+    "__chzzk_ex_blind_cache_v1__:early-channel-b";
+  const channelBPayload = runtime.sessionStorageState.get(channelBKey);
+  assert.match(channelBPayload, /early channel B original/);
+  assert.doesNotMatch(channelBPayload, /early channel A original/);
+});
+
+test("route-checks a reused restored row before the 100ms verifier processes it", () => {
+  const now = 2_000_000_000_000;
+  const firstTime = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const runtime = createRuntime({
+    dateNow: now,
+    message: {
+      key: "verified-channel-a-key",
+      time: firstTime,
+      user: "channel-a-user",
+      status: "BLIND",
+      content: BLIND_PLACEHOLDER,
+      originalContent: "verified channel A original",
+      profile: { nickname: "channel-a-user" }
+    },
+    renderedText: BLIND_PLACEHOLDER
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  runtime.flushTimeouts(250);
+  assert.equal(runtime.messageElement.textContent, "verified channel A original");
+
+  runtime.setLocation("/live/verified-channel-b");
+  runtime.setMessage({
+    key: "verified-channel-b-key",
+    time: firstTime + 1000,
+    user: "channel-b-user",
+    status: "NORMAL",
+    content: "verified channel B original",
+    originalContent: "verified channel B original",
+    profile: { nickname: "channel-b-user" }
+  });
+  runtime.messageElement.className = "_text_test";
+  runtime.messageElement.textContent = "verified channel B original";
+  runtime.runIntervals(100);
+  runtime.flushTimeouts(250);
+
+  const channelBKey =
+    "__chzzk_ex_blind_cache_v1__:verified-channel-b";
+  const channelBPayload = runtime.sessionStorageState.get(channelBKey);
+  assert.match(channelBPayload, /verified channel B original/);
+  assert.doesNotMatch(channelBPayload, /verified channel A original/);
+  assert.equal(runtime.messageElement.dataset.cngBlindedRestored, undefined);
+});
+
+test("clears a restored row while the previous channel DOM remains stale", () => {
+  const runtime = createRuntime({
+    message: {
+      key: "stale-restored-key",
+      time: new Date(2026, 7, 29, 12, 0, 0).getTime(),
+      user: "channel-a-user",
+      status: "BLIND",
+      content: BLIND_PLACEHOLDER,
+      originalContent: "stale restored original",
+      profile: { nickname: "channel-a-user" }
+    },
+    renderedText: BLIND_PLACEHOLDER
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  assert.equal(runtime.messageElement.textContent, "stale restored original");
+
+  runtime.setLocation("/live/stale-channel-b");
+  runtime.runIntervals(100);
+
+  assert.equal(runtime.messageElement.textContent, BLIND_PLACEHOLDER);
+  assert.equal(runtime.messageElement.dataset.cngBlindedRestored, undefined);
+});
+
+test("does not restore an expired tab-cache entry", () => {
+  const time = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const storageKey = "__chzzk_ex_blind_cache_v1__:channel";
+  const sessionStorageState = new Map([
+    [
+      storageKey,
+      JSON.stringify({
+        savedAt: Date.now(),
+        exact: [],
+        stable: [
+          ["tester:" + time, "expired original", Date.now() - 7 * 60 * 60 * 1000]
+        ]
+      })
+    ]
+  ]);
+  const runtime = createRuntime({
+    message: {
+      key: "expired-hidden-message",
+      time,
+      user: "tester",
+      status: "HIDDEN",
+      content: "",
+      originalContent: "",
+      profile: { nickname: "tester" }
+    },
+    renderedText: BLIND_PLACEHOLDER,
+    sessionStorageState
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+
+  assert.equal(runtime.messageElement.textContent, BLIND_PLACEHOLDER);
+  assert.equal(runtime.messageElement.dataset.cngBlindedRestored, undefined);
+  assert.equal(sessionStorageState.has(storageKey), false);
+});
+
+test("rewrites mixed tab-cache data without expired originals", () => {
+  const now = 2_000_000_000_000;
+  const time = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const storageKey = "__chzzk_ex_blind_cache_v1__:channel";
+  const sessionStorageState = new Map([
+    [
+      storageKey,
+      JSON.stringify({
+        savedAt: now,
+        exact: [["valid-key", "valid original", now]],
+        stable: [
+          [`tester:${time}`, "expired original", now - 7 * 60 * 60 * 1000]
+        ]
+      })
+    ]
+  ]);
+  const runtime = createRuntime({
+    dateNow: now,
+    message: {
+      key: "unrelated-hidden-key",
+      time,
+      user: "tester",
+      status: "HIDDEN",
+      content: "",
+      originalContent: "",
+      profile: { nickname: "tester" }
+    },
+    renderedText: BLIND_PLACEHOLDER,
+    sessionStorageState
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+
+  const rewritten = JSON.parse(sessionStorageState.get(storageKey));
+  assert.deepEqual(rewritten.exact, [["valid-key", "valid original", now]]);
+  assert.deepEqual(rewritten.stable, []);
+  assert.equal(sessionStorageState.get(storageKey).includes("expired original"), false);
+  assert.equal(runtime.messageElement.textContent, BLIND_PLACEHOLDER);
+});
+
+test("rejects a tab-cache timestamp beyond the clock-skew tolerance", () => {
+  const now = 2_000_000_000_000;
+  const time = new Date(2026, 7, 29, 12, 0, 0).getTime();
+  const storageKey = "__chzzk_ex_blind_cache_v1__:channel";
+  const sessionStorageState = new Map([
+    [
+      storageKey,
+      JSON.stringify({
+        savedAt: now,
+        exact: [],
+        stable: [[`tester:${time}`, "future original", now + 6 * 60 * 1000]]
+      })
+    ]
+  ]);
+  const runtime = createRuntime({
+    dateNow: now,
+    message: {
+      key: "future-hidden-key",
+      time,
+      user: "tester",
+      status: "HIDDEN",
+      content: "",
+      originalContent: "",
+      profile: { nickname: "tester" }
+    },
+    renderedText: BLIND_PLACEHOLDER,
+    sessionStorageState
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+
+  assert.equal(runtime.messageElement.textContent, BLIND_PLACEHOLDER);
+  assert.equal(sessionStorageState.has(storageKey), false);
+});
+
 test("keeps a restored nickname stable and rechecks a hydrated gradient", () => {
   const runtime = createRuntime({
     nicknameStyle: {
@@ -1238,4 +2299,33 @@ test("clears its marker when CleanBot shows the native original", () => {
   assert.equal(runtime.messageElement.textContent, original);
   assert.equal(runtime.messageElement.dataset.cngBlindedRestored, undefined);
   assert.equal(runtime.messageElement.classList.contains("cng-restored-message"), false);
+});
+
+test("keeps a normal blind restoration when the native hidden class changes", () => {
+  const original = "moderator-hidden original";
+  const runtime = createRuntime({
+    message: {
+      key: "moderator-hidden-message",
+      time: new Date(2026, 7, 29, 12, 0, 0).getTime(),
+      user: "tester",
+      status: "BLIND",
+      content: BLIND_PLACEHOLDER,
+      originalContent: original,
+      profile: { nickname: "tester" }
+    },
+    renderedText: BLIND_PLACEHOLDER
+  });
+  runtime.dispatchSettings({ restoreBlindedMessages: true });
+  runtime.flushTimeouts(50);
+  assert.equal(runtime.messageElement.dataset.cngBlindedRestored, "moderator-hidden-message");
+
+  runtime.messageElement.className = "_text_test";
+  runtime.runIntervals(100);
+
+  assert.equal(runtime.messageElement.textContent, original);
+  assert.equal(
+    runtime.messageElement.dataset.cngBlindedRestored,
+    "moderator-hidden-message"
+  );
+  assert.equal(runtime.messageElement.classList.contains("cng-restored-message"), true);
 });

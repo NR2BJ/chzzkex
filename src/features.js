@@ -40,6 +40,14 @@
     "[class*='progress-slider'][role='slider']",
     "[data-role*='progress'][role='slider']"
   ].join(", ");
+  const LIVE_EDGE_SEEK_TOLERANCE_SECONDS = 2;
+  const BLIND_CACHE_STORAGE_PREFIX = "__chzzk_ex_blind_cache_v1__:";
+  const BLIND_CACHE_MAX_ENTRIES = 1000;
+  const BLIND_CACHE_MAX_TEXT_LENGTH = 2000;
+  const BLIND_CACHE_MAX_AGE_MS = 6 * 60 * 60 * 1000;
+  const BLIND_CACHE_FUTURE_TOLERANCE_MS = 5 * 60 * 1000;
+  const BLIND_CACHE_SAVE_DELAY_MS = 250;
+  const BLIND_CACHE_SEEN_REFRESH_MS = 60 * 1000;
   const POWER_READY_TEXT =
     /(?:통나무\s*파워.*(?:배달\s*완료|받기|수령)|(?:배달\s*완료|받기|수령).*통나무\s*파워)/i;
   const POWER_ACTION_TEXT = /^(?:배달\s*완료|받기|수령)$/i;
@@ -50,14 +58,15 @@
   const LOUDNESS_LONG_WINDOW_MS = 2 * 60 * 1000;
   const LOUDNESS_SHORT_WINDOW_MS = 3000;
   const LOUDNESS_SHORT_MIN_BLOCKS = 27;
-  const LOUDNESS_PEAK_WINDOW_MS = 15 * 1000;
-  const LOUDNESS_ANCHOR_WINDOW_MS = 10 * 60 * 1000;
+  const LOUDNESS_ANCHOR_WINDOW_MS = 2 * 60 * 1000;
+  const LOUDNESS_ANCHOR_MIN_SAMPLES = 20;
   const LOUDNESS_SHORT_TERM_PERCENTILE = 0.95;
   const LOUDNESS_PEAK_PERCENTILE = 0.99;
   const LOUDNESS_SHORT_TERM_ALLOWANCE_DB = 4;
+  const LOUDNESS_INTEGRATED_CEILING_ALLOWANCE_DB = 2;
   const LOUDNESS_PEAK_CEILING_DB = -3;
   const LOUDNESS_PROVISIONAL_MAX_BOOST_DB = 6;
-  const LOUDNESS_GAIN_INCREASE_STEP_DB = 0.05;
+  const LOUDNESS_GAIN_INCREASE_STEP_DB = 0.5;
   const LIMITER_THRESHOLD_DB = -1;
   const LIMITER_RATIO = 20;
   const LIMITER_ATTACK_SECONDS = 0;
@@ -148,7 +157,9 @@
   }
 
   function customTimelineSlider(element) {
-    return element?.closest?.(".cng-timeline-assist[role='slider']") || null;
+    return (
+      element?.closest?.(".cng-timeline-assist__track[role='slider']") || null
+    );
   }
 
   function nativeTimelineSlider(element) {
@@ -168,18 +179,18 @@
   const timelineAssist = {
     activePointerId: null,
     slider: null,
+    dragVideo: null,
+    dragRoute: "",
     element: null,
     timelineVideo: null,
     timelineRoute: "",
-    nativeTimelineVideo: null,
-    nativeTimelineRoute: "",
-    nativeTimelineAvailable: false,
     liveAnchorEnd: null,
     liveAnchorAt: 0,
     lastObservedEnd: null,
     displayDuration: 0,
 
     resetTimeline(video, range) {
+      this.cancelDrag();
       this.timelineVideo = video;
       this.timelineRoute = location.pathname;
       this.liveAnchorEnd = range.end;
@@ -220,8 +231,13 @@
     },
 
     cancelDrag() {
+      this.slider
+        ?.closest?.(".cng-timeline-assist")
+        ?.classList?.remove("is-dragging");
       this.activePointerId = null;
       this.slider = null;
+      this.dragVideo = null;
+      this.dragRoute = "";
     },
 
     mount(player) {
@@ -231,54 +247,28 @@
       this.remove();
       const element = document.createElement("div");
       element.className = "cng-timeline-assist";
-      element.setAttribute("role", "slider");
-      element.setAttribute("tabindex", "0");
-      element.setAttribute("aria-label", "타임라인 보조");
       const track = document.createElement("span");
       const fill = document.createElement("span");
       const handle = document.createElement("span");
-      const start = document.createElement("span");
       const position = document.createElement("span");
-      const live = document.createElement("span");
+      const live = document.createElement("button");
       track.className = "cng-timeline-assist__track";
       fill.className = "cng-timeline-assist__fill";
       handle.className = "cng-timeline-assist__handle";
-      start.className = "cng-timeline-assist__start";
       position.className = "cng-timeline-assist__position";
       live.className = "cng-timeline-assist__live";
-      live.textContent = "LIVE";
+      track.setAttribute("role", "slider");
+      track.setAttribute("tabindex", "0");
+      track.setAttribute("aria-label", "라이브 타임라인");
+      position.setAttribute("aria-hidden", "true");
+      live.setAttribute("type", "button");
+      live.setAttribute("title", "실시간으로 이동");
+      live.textContent = "실시간";
       track.append(fill, handle);
-      element.append(track, start, position, live);
+      element.append(position, live, track);
       player.appendChild(element);
       this.element = element;
       return element;
-    },
-
-    observeNativeTimeline(player, video) {
-      if (
-        video !== this.nativeTimelineVideo ||
-        location.pathname !== this.nativeTimelineRoute
-      ) {
-        this.nativeTimelineVideo = video;
-        this.nativeTimelineRoute = location.pathname;
-        this.nativeTimelineAvailable = false;
-      }
-
-      const candidates = Array.from(
-        player.querySelectorAll(NATIVE_TIMELINE_SELECTOR)
-      ).map((element) => {
-        const style = getComputedStyle(element);
-        const bounds = element.getBoundingClientRect();
-        return {
-          custom: element.classList.contains("cng-timeline-assist"),
-          display: style.display,
-          visibility: style.visibility,
-          width: bounds.width,
-          height: bounds.height
-        };
-      });
-      this.nativeTimelineAvailable = core.hasUsableNativeTimeline(candidates);
-      return this.nativeTimelineAvailable;
     },
 
     tick() {
@@ -302,11 +292,6 @@
         return;
       }
 
-      if (this.observeNativeTimeline(player, video)) {
-        this.remove();
-        return;
-      }
-
       const element = this.mount(player);
       const liveEdge = this.liveEdge(video, range);
       const behind = Math.max(0, liveEdge - video.currentTime);
@@ -319,17 +304,61 @@
       const ratio = atLiveEdge
         ? 1
         : core.timelineProgress(behind, this.displayDuration);
+      const displayBehind = atLiveEdge ? 0 : behind;
+      const displaySeconds = Math.max(0, Math.round(displayBehind));
       element.style.setProperty("--cng-timeline-progress", `${ratio * 100}%`);
-      element.querySelector(".cng-timeline-assist__start").textContent =
-        core.formatOffset(this.displayDuration);
-      element.querySelector(".cng-timeline-assist__position").textContent =
-        atLiveEdge ? "현재 LIVE" : `현재 ${core.formatOffset(behind)}`;
-      element.setAttribute("aria-valuemin", String(-Math.round(this.displayDuration)));
-      element.setAttribute("aria-valuemax", "0");
-      element.setAttribute("aria-valuenow", String(-Math.round(behind)));
-      element.setAttribute(
+      const position = element.querySelector(".cng-timeline-assist__position");
+      const positionText = core.formatOffset(displaySeconds);
+      if (position.textContent !== positionText) {
+        position.textContent = positionText;
+      }
+      if (atLiveEdge) {
+        element.classList.add("is-live");
+      } else {
+        element.classList.remove("is-live");
+      }
+      const track = element.querySelector(".cng-timeline-assist__track");
+      track.setAttribute("aria-valuemin", String(-Math.round(this.displayDuration)));
+      track.setAttribute("aria-valuemax", "0");
+      track.setAttribute("aria-valuenow", String(-displaySeconds));
+      track.setAttribute(
         "aria-valuetext",
-        behind < 1 ? "실시간" : `실시간 ${Math.round(behind)}초 전`
+        displaySeconds === 0
+          ? "실시간"
+          : `실시간 ${displaySeconds}초 전`
+      );
+    },
+
+    commitSeek(video, target, range) {
+      const safeEnd = Math.max(range.start, range.end - 0.25);
+      const nextTime = core.clamp(target, range.start, safeEnd);
+      const returningToLive =
+        nextTime >= range.end - LIVE_EDGE_SEEK_TOLERANCE_SECONDS;
+      if (returningToLive) {
+        const route = isLiveRoute() ? location.pathname : "";
+        initialLiveEdgeSync.cancel(route);
+        if (Math.abs(video.currentTime - nextTime) > 0.001) {
+          initialLiveEdgeSync.beginOwnSeek(video);
+        }
+        playbackState.clearManualSeekIntent();
+      } else {
+        playbackState.markManualSeekIntent(true);
+      }
+      video.currentTime = nextTime;
+      return true;
+    },
+
+    goLive(video, range) {
+      this.cancelDrag();
+      return this.commitSeek(video, range.end - 0.25, range);
+    },
+
+    isCurrentDrag() {
+      return Boolean(
+        this.slider?.isConnected &&
+        this.dragVideo &&
+        this.dragVideo === mainVideo() &&
+        this.dragRoute === location.pathname
       );
     },
 
@@ -340,9 +369,7 @@
         return false;
       }
 
-      const bounds =
-        slider.querySelector?.(".cng-timeline-assist__track")?.getBoundingClientRect() ||
-        slider.getBoundingClientRect();
+      const bounds = slider.getBoundingClientRect();
       if (bounds.width <= 0) {
         return false;
       }
@@ -359,13 +386,13 @@
         return false;
       }
 
-      playbackState.markManualSeekIntent(target < range.end - 2);
-      video.currentTime = target;
-      return true;
+      return this.commitSeek(video, target, range);
     },
 
     onKeyDown(event) {
-      const slider = event.target?.closest?.(".cng-timeline-assist[role='slider']");
+      const slider = event.target?.closest?.(
+        ".cng-timeline-assist__track[role='slider']"
+      );
       if (!settings.timelineAssist || !slider) {
         return;
       }
@@ -385,15 +412,16 @@
       } else if (event.key === "Home") {
         target = range.start;
       } else if (event.key === "End") {
-        target = range.end - 0.25;
+        timelineAssist.goLive(video, range);
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        return;
       }
       if (target === null) {
         return;
       }
 
-      const nextTime = core.clamp(target, range.start, range.end - 0.25);
-      playbackState.markManualSeekIntent(nextTime < range.end - 2);
-      video.currentTime = nextTime;
+      timelineAssist.commitSeek(video, target, range);
       event.preventDefault();
       event.stopImmediatePropagation();
     },
@@ -410,6 +438,9 @@
 
       timelineAssist.activePointerId = event.pointerId;
       timelineAssist.slider = slider;
+      timelineAssist.dragVideo = mainVideo();
+      timelineAssist.dragRoute = location.pathname;
+      slider.closest(".cng-timeline-assist")?.classList.add("is-dragging");
       event.preventDefault();
       event.stopImmediatePropagation();
     },
@@ -425,6 +456,10 @@
         timelineAssist.cancelDrag();
         return;
       }
+      if (!timelineAssist.isCurrentDrag()) {
+        timelineAssist.cancelDrag();
+        return;
+      }
 
       timelineAssist.seek(event, timelineAssist.slider);
       event.preventDefault();
@@ -433,6 +468,11 @@
 
     onPointerUp(event) {
       if (timelineAssist.activePointerId !== event.pointerId) {
+        return;
+      }
+
+      if (!timelineAssist.isCurrentDrag()) {
+        timelineAssist.cancelDrag();
         return;
       }
 
@@ -453,7 +493,23 @@
       event.stopImmediatePropagation();
     },
 
+    onClick(event) {
+      const live = event.target?.closest?.(".cng-timeline-assist__live");
+      if (!settings.timelineAssist || !live) {
+        return;
+      }
+      const video = mainVideo();
+      const range = seekableWindow(video);
+      if (!video || !range || range.duration > 300) {
+        return;
+      }
+      timelineAssist.goLive(video, range);
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    },
+
     start() {
+      document.addEventListener("click", this.onClick, true);
       document.addEventListener("pointerdown", this.onPointerDown, true);
       document.addEventListener("pointermove", this.onPointerMove, true);
       document.addEventListener("pointerup", this.onPointerUp, true);
@@ -604,9 +660,8 @@
         return;
       }
       if (
-        (playbackState.userSeekIntentUntil > 0 &&
-          performance.now() <= playbackState.userSeekIntentUntil) ||
-        initialLiveEdgeSync.hasObservedCandidate(video)
+        playbackState.userSeekIntentUntil > 0 &&
+        performance.now() <= playbackState.userSeekIntentUntil
       ) {
         playbackState.markManualSeekIntent();
       }
@@ -664,16 +719,6 @@
       if (this.route === route) {
         this.decided = true;
       }
-    },
-
-    hasObservedCandidate(video) {
-      const routeChanged =
-        (isLiveRoute() ? location.pathname : "") !== this.route;
-      return Boolean(
-        video &&
-        video === this.candidateVideo &&
-        (!this.decided || routeChanged)
-      );
     },
 
     beginOwnSeek(video) {
@@ -740,11 +785,11 @@
         range.start,
         range.end
       );
-      this.decided = true;
       if (target === null) {
         return;
       }
 
+      this.decided = true;
       const previousTime = video.currentTime;
       this.beginOwnSeek(video);
       playbackState.clearManualSeekIntent();
@@ -768,6 +813,7 @@
     graphs: new WeakMap(),
     outputGain: null,
     compressor: null,
+    compressorTrim: null,
     limiter: null,
     limiterTrim: null,
     analysers: [],
@@ -776,20 +822,18 @@
     peakSampleBuffers: [],
     blockEnergies: [],
     recentBlockEnergies: [],
-    recentRenderedPeaks: [],
     shortTermLoudnessHistory: [],
     sourcePeakHistory: [],
     gainDb: 0,
     longTermGainDb: 0,
     safetyCeilingDb: DEFAULT_SETTINGS.normalizationMaxBoostDb,
     shortTermLoudnessDb: Number.NEGATIVE_INFINITY,
-    renderedPeakDb: Number.NEGATIVE_INFINITY,
     adaptiveApplied: false,
     activeBlockCount: 0,
     nextGainUpdateAt: 0,
     unlocked: false,
     resumePending: false,
-    lastResumeAttemptAt: 0,
+    lastResumeAttemptAt: Number.NEGATIVE_INFINITY,
     lastSignalAt: 0,
     lastClipRiskLogAt: 0,
     lastPlaybackRate: null,
@@ -825,12 +869,12 @@
       try {
         try {
           this.context = new AudioContextClass({
-            latencyHint: "playback",
+            latencyHint: "interactive",
             sampleRate: 48000
           });
         } catch {
           try {
-            this.context = new AudioContextClass({ latencyHint: "playback" });
+            this.context = new AudioContextClass({ latencyHint: "interactive" });
           } catch {
             this.context = new AudioContextClass();
           }
@@ -891,6 +935,7 @@
       this.graph = null;
       this.outputGain = null;
       this.compressor = null;
+      this.compressorTrim = null;
       this.limiter = null;
       this.limiterTrim = null;
       this.analysers = [];
@@ -904,14 +949,26 @@
         return;
       }
       const now = this.context.currentTime;
-      const currentGain = this.outputGain.gain.value;
-      this.outputGain.gain.cancelScheduledValues(now);
-      this.outputGain.gain.setValueAtTime(currentGain, now);
+      this.holdAudioParam(this.outputGain.gain, now);
       this.outputGain.gain.setTargetAtTime(
         10 ** (gainDb / 20),
         now,
         timeConstant
       );
+    },
+
+    holdAudioParam(parameter, now = this.context?.currentTime ?? 0) {
+      if (typeof parameter?.cancelAndHoldAtTime === "function") {
+        try {
+          parameter.cancelAndHoldAtTime(now);
+          return;
+        } catch {}
+      }
+      const currentValue = parameter?.value;
+      parameter?.cancelScheduledValues(now);
+      if (Number.isFinite(currentValue)) {
+        parameter.setValueAtTime(currentValue, now);
+      }
     },
 
     currentMaximumBoostDb() {
@@ -943,35 +1000,72 @@
       );
     },
 
-    configureCompressor(enabled = settings.compressAudio) {
-      if (!this.compressor || !this.context) {
-        return;
-      }
-      const now = this.context.currentTime;
+    compressorConfiguration(
+      video = this.video,
+      enabled = settings.compressAudio
+    ) {
       const preset = this.currentCompressorPreset();
+      const ratio = enabled ? preset.ratio : 1;
+      const threshold = enabled
+        ? core.compressorThresholdForMediaVolume(
+            preset.thresholdDb,
+            video?.volume
+          )
+        : preset.thresholdDb;
       const values = {
-        threshold: core.compressorThresholdForMediaVolume(
-          preset.thresholdDb,
-          this.video?.volume
-        ),
+        threshold,
         knee: preset.kneeDb,
-        ratio: enabled ? preset.ratio : 1,
+        ratio,
         attack: preset.attackSeconds,
         release: preset.releaseSeconds
       };
-      for (const [name, value] of Object.entries(values)) {
-        const parameter = this.compressor[name];
-        parameter.cancelScheduledValues(now);
-        parameter.setValueAtTime(parameter.value, now);
-        parameter.setTargetAtTime(value, now, 0.05);
-      }
+      const trimDb = enabled
+        ? core.compressorVolumeCompensationDb(
+            preset.thresholdDb,
+            ratio,
+            video?.volume
+          )
+        : 0;
+      const trimGain = 10 ** (trimDb / 20);
+      return {
+        key: JSON.stringify([
+          enabled,
+          ...Object.values(values),
+          trimGain
+        ]),
+        values,
+        trimGain
+      };
     },
 
-    configureLimiter(enabled = settings.normalizeVolume) {
-      if (!this.limiter || !this.limiterTrim || !this.context) {
-        return;
+    configureCompressor(
+      enabled = settings.compressAudio,
+      graph = this.graph,
+      video = this.video
+    ) {
+      if (!graph?.compressor || !graph.compressorTrim || !this.context) {
+        return false;
+      }
+      const configuration = this.compressorConfiguration(video, enabled);
+      if (graph.compressorConfigKey === configuration.key) {
+        return false;
       }
       const now = this.context.currentTime;
+      const { values, trimGain } = configuration;
+      for (const [name, value] of Object.entries(values)) {
+        const parameter = graph.compressor[name];
+        this.holdAudioParam(parameter, now);
+        parameter.setTargetAtTime(value, now, 0.05);
+      }
+      this.holdAudioParam(graph.compressorTrim.gain, now);
+      graph.compressorTrim.gain.setTargetAtTime(trimGain, now, 0.05);
+      graph.compressorConfigKey = configuration.key;
+      return true;
+    },
+
+    limiterConfiguration(
+      enabled = settings.normalizeVolume || settings.compressAudio
+    ) {
       const ratio = enabled ? LIMITER_RATIO : 1;
       const values = {
         threshold: LIMITER_THRESHOLD_DB,
@@ -980,25 +1074,45 @@
         attack: LIMITER_ATTACK_SECONDS,
         release: LIMITER_RELEASE_SECONDS
       };
-      for (const [name, value] of Object.entries(values)) {
-        const parameter = this.limiter[name];
-        parameter.cancelScheduledValues(now);
-        parameter.setValueAtTime(parameter.value, now);
-        parameter.setTargetAtTime(value, now, 0.02);
-      }
       const trimDb = enabled
         ? core.compressorMakeupTrimDb(LIMITER_THRESHOLD_DB, ratio)
         : 0;
-      this.limiterTrim.gain.cancelScheduledValues(now);
-      this.limiterTrim.gain.setValueAtTime(this.limiterTrim.gain.value, now);
-      this.limiterTrim.gain.setTargetAtTime(10 ** (trimDb / 20), now, 0.02);
+      const trimGain = 10 ** (trimDb / 20);
+      return {
+        key: JSON.stringify([enabled, ...Object.values(values), trimGain]),
+        values,
+        trimGain
+      };
+    },
+
+    configureLimiter(
+      enabled = settings.normalizeVolume || settings.compressAudio,
+      graph = this.graph
+    ) {
+      if (!graph?.limiter || !graph.limiterTrim || !this.context) {
+        return false;
+      }
+      const configuration = this.limiterConfiguration(enabled);
+      if (graph.limiterConfigKey === configuration.key) {
+        return false;
+      }
+      const now = this.context.currentTime;
+      const { values, trimGain } = configuration;
+      for (const [name, value] of Object.entries(values)) {
+        const parameter = graph.limiter[name];
+        this.holdAudioParam(parameter, now);
+        parameter.setTargetAtTime(value, now, 0.02);
+      }
+      this.holdAudioParam(graph.limiterTrim.gain, now);
+      graph.limiterTrim.gain.setTargetAtTime(trimGain, now, 0.02);
+      graph.limiterConfigKey = configuration.key;
+      return true;
     },
 
     resetMeasurement(route = channelIdFromLocation()) {
       this.route = route;
       this.blockEnergies = [];
       this.recentBlockEnergies = [];
-      this.recentRenderedPeaks = [];
       this.shortTermLoudnessHistory = [];
       this.sourcePeakHistory = [];
       this.adaptiveApplied = false;
@@ -1007,7 +1121,6 @@
       this.longTermGainDb = 0;
       this.safetyCeilingDb = this.currentMaximumBoostDb();
       this.shortTermLoudnessDb = Number.NEGATIVE_INFINITY;
-      this.renderedPeakDb = Number.NEGATIVE_INFINITY;
       this.lastSignalAt = 0;
       this.lastClipRiskLogAt = 0;
       this.lastPlaybackRate = null;
@@ -1019,19 +1132,15 @@
       this.route = "";
       this.blockEnergies = [];
       this.recentBlockEnergies = [];
-      this.recentRenderedPeaks = [];
       this.shortTermLoudnessHistory = [];
       this.sourcePeakHistory = [];
       this.gainDb = 0;
       this.longTermGainDb = 0;
       this.safetyCeilingDb = this.currentMaximumBoostDb();
       this.shortTermLoudnessDb = Number.NEGATIVE_INFINITY;
-      this.renderedPeakDb = Number.NEGATIVE_INFINITY;
       this.adaptiveApplied = false;
       this.activeBlockCount = 0;
       this.nextGainUpdateAt = 0;
-      this.resumePending = false;
-      this.lastResumeAttemptAt = 0;
       this.lastSignalAt = 0;
       this.lastClipRiskLogAt = 0;
       this.lastPlaybackRate = null;
@@ -1039,17 +1148,34 @@
     },
 
     connectGraph(graph) {
-      if (graph.connected) {
-        return;
+      if (graph?.failed) {
+        return false;
       }
-      graph.source.connect(graph.compressor);
-      graph.connected = true;
+      if (graph.connected) {
+        return true;
+      }
+      try {
+        graph.source.connect(graph.compressor);
+        graph.connected = true;
+        return true;
+      } catch (error) {
+        try {
+          graph.source.disconnect();
+        } catch {}
+        try {
+          graph.source.connect(this.context.destination);
+          graph.connected = true;
+        } catch {}
+        graph.failed = true;
+        log("audio processing graph bypassed", error);
+        return false;
+      }
     },
 
     createGraph(video) {
-      const source = this.context.createMediaElementSource(video);
       const outputGain = this.context.createGain();
       const compressor = this.context.createDynamicsCompressor();
+      const compressorTrim = this.context.createGain();
       const limiter = this.context.createDynamicsCompressor();
       const limiterTrim = this.context.createGain();
       const splitter = this.context.createChannelSplitter(2);
@@ -1057,29 +1183,26 @@
       const analysers = [];
       const peakAnalysers = [];
       const weightingNodes = [];
-      const compressorPreset = this.currentCompressorPreset();
+      const compressorConfiguration = this.compressorConfiguration(video);
+      const limiterConfiguration = this.limiterConfiguration();
 
-      compressor.threshold.value = compressorPreset.thresholdDb;
-      compressor.knee.value = compressorPreset.kneeDb;
-      compressor.ratio.value = settings.compressAudio
-        ? compressorPreset.ratio
-        : 1;
-      compressor.attack.value = compressorPreset.attackSeconds;
-      compressor.release.value = compressorPreset.releaseSeconds;
-      limiter.threshold.value = LIMITER_THRESHOLD_DB;
-      limiter.knee.value = 0;
-      limiter.ratio.value = settings.normalizeVolume ? LIMITER_RATIO : 1;
-      limiter.attack.value = LIMITER_ATTACK_SECONDS;
-      limiter.release.value = LIMITER_RELEASE_SECONDS;
-      limiterTrim.gain.value = 10 ** (
-        (settings.normalizeVolume
-          ? core.compressorMakeupTrimDb(LIMITER_THRESHOLD_DB, LIMITER_RATIO)
-          : 0) / 20
-      );
-      compressor.connect(outputGain).connect(limiter).connect(limiterTrim).connect(
-        this.context.destination
-      );
-      compressor.connect(splitter);
+      for (const [name, value] of Object.entries(
+        compressorConfiguration.values
+      )) {
+        compressor[name].value = value;
+      }
+      compressorTrim.gain.value = compressorConfiguration.trimGain;
+      for (const [name, value] of Object.entries(limiterConfiguration.values)) {
+        limiter[name].value = value;
+      }
+      limiterTrim.gain.value = limiterConfiguration.trimGain;
+      compressor
+        .connect(compressorTrim)
+        .connect(outputGain)
+        .connect(limiter)
+        .connect(limiterTrim)
+        .connect(this.context.destination);
+      compressorTrim.connect(splitter);
       silent.gain.value = 0;
       silent.connect(this.context.destination);
 
@@ -1130,20 +1253,48 @@
         peakAnalysers.push(peakAnalyser);
       }
 
+      const downstreamNodes = [
+        outputGain,
+        compressor,
+        compressorTrim,
+        limiter,
+        limiterTrim,
+        splitter,
+        silent,
+        ...analysers,
+        ...peakAnalysers,
+        ...weightingNodes
+      ];
+      let source;
+      try {
+        source = this.context.createMediaElementSource(video);
+      } catch (error) {
+        for (const node of downstreamNodes) {
+          try {
+            node.disconnect();
+          } catch {}
+        }
+        throw error;
+      }
+
       const graph = {
         source,
         outputGain,
         compressor,
+        compressorTrim,
         limiter,
         limiterTrim,
         splitter,
         analysers,
         peakAnalysers,
         weightingNodes,
-        connected: false
+        compressorConfigKey: compressorConfiguration.key,
+        limiterConfigKey: limiterConfiguration.key,
+        connected: false,
+        failed: false
       };
-      this.connectGraph(graph);
       this.graphs.set(video, graph);
+      this.connectGraph(graph);
       return graph;
     },
 
@@ -1179,14 +1330,18 @@
 
       this.detachVideo();
       try {
-        this.failure = false;
         const graph = this.graphs.get(video) || this.createGraph(video);
-        this.connectGraph(graph);
+        if (!this.connectGraph(graph)) {
+          this.failure = true;
+          return;
+        }
 
+        this.failure = false;
         this.video = video;
         this.graph = graph;
         this.outputGain = graph.outputGain;
         this.compressor = graph.compressor;
+        this.compressorTrim = graph.compressorTrim;
         this.limiter = graph.limiter;
         this.limiterTrim = graph.limiterTrim;
         this.configureCompressor();
@@ -1222,13 +1377,13 @@
       const windows = [
         [this.blockEnergies, LOUDNESS_LONG_WINDOW_MS],
         [this.recentBlockEnergies, LOUDNESS_SHORT_WINDOW_MS],
-        [this.recentRenderedPeaks, LOUDNESS_PEAK_WINDOW_MS],
         [this.shortTermLoudnessHistory, LOUDNESS_ANCHOR_WINDOW_MS],
         [this.sourcePeakHistory, LOUDNESS_ANCHOR_WINDOW_MS]
       ];
       for (const [samples, maxAgeMs] of windows) {
         core.appendTimedSample(samples, Number.NaN, now, maxAgeMs);
       }
+      this.activeBlockCount = this.blockEnergies.length;
     },
 
     currentStats() {
@@ -1239,21 +1394,20 @@
       if (!stats) {
         return null;
       }
+      const shortTermValues = core.timedSampleValues(
+        this.shortTermLoudnessHistory
+      );
       const shortTermAnchorDb = core.percentile(
-        core.timedSampleValues(this.shortTermLoudnessHistory),
+        shortTermValues,
         LOUDNESS_SHORT_TERM_PERCENTILE
       );
       const peakAnchorDb = core.percentilePeakDb(
         core.timedSampleValues(this.sourcePeakHistory),
         LOUDNESS_PEAK_PERCENTILE
       );
-      const anchorConfirmed = core.normalizationAnchorConfirmed({
-        shortTermLoudnessDb:
-          shortTermAnchorDb ?? Number.NEGATIVE_INFINITY,
-        medianLoudnessDb: stats.medianDb,
-        peakDb: peakAnchorDb,
-        targetDb: this.currentTargetLoudnessDb()
-      });
+      const anchorConfirmed =
+        shortTermValues.length >= LOUDNESS_ANCHOR_MIN_SAMPLES &&
+        Number.isFinite(shortTermAnchorDb);
       return {
         ...stats,
         shortTermAnchorDb:
@@ -1270,6 +1424,8 @@
         peakDb: stats.peakAnchorDb,
         targetDb: this.currentTargetLoudnessDb(),
         shortTermAllowanceDb: LOUDNESS_SHORT_TERM_ALLOWANCE_DB,
+        integratedCeilingAllowanceDb:
+          LOUDNESS_INTEGRATED_CEILING_ALLOWANCE_DB,
         peakCeilingDb: LOUDNESS_PEAK_CEILING_DB,
         maximumDb: this.currentMaximumBoostDb(),
         provisionalMaximumDb: LOUDNESS_PROVISIONAL_MAX_BOOST_DB,
@@ -1292,15 +1448,10 @@
                 recentBlockEnergies.length
             )
           : Number.NEGATIVE_INFINITY;
-      this.renderedPeakDb = core.maximumPeakDb(
-        core.timedSampleValues(this.recentRenderedPeaks)
-      );
       this.safetyCeilingDb = core.normalizationSafetyCeilingDb({
         shortTermLoudnessDb: this.shortTermLoudnessDb,
-        renderedPeakDb: this.renderedPeakDb,
         shortTermCeilingDb:
           this.currentTargetLoudnessDb() + LOUDNESS_SHORT_TERM_ALLOWANCE_DB,
-        peakCeilingDb: LOUDNESS_PEAK_CEILING_DB,
         maximumDb: this.currentMaximumBoostDb()
       });
       return this.safetyCeilingDb;
@@ -1327,7 +1478,7 @@
       this.gainDb = targetGainDb;
       this.applyGain(
         targetGainDb,
-        targetGainDb < previousGainDb ? 0.75 : 10
+        targetGainDb < previousGainDb ? 0.5 : 5
       );
     },
 
@@ -1337,12 +1488,11 @@
         return false;
       }
       this.gainDb = safetyCeilingDb;
-      this.applyGain(this.gainDb, 0.75);
+      this.applyGain(this.gainDb, 0.5);
       log("lowered loudness gain for recent audio", {
         gainDb: this.gainDb,
         longTermGainDb: this.longTermGainDb,
-        shortTermLoudnessDb: this.shortTermLoudnessDb,
-        renderedPeakDb: this.renderedPeakDb
+        shortTermLoudnessDb: this.shortTermLoudnessDb
       });
       return true;
     },
@@ -1367,13 +1517,15 @@
       if (!wasApplied || targetGainDb < this.gainDb - 0.05) {
         nextGainDb = targetGainDb;
       } else if (targetGainDb > this.gainDb + 0.05) {
-        nextGainDb = Math.min(targetGainDb, this.gainDb + 0.25);
+        nextGainDb = Math.min(
+          targetGainDb,
+          this.gainDb + LOUDNESS_GAIN_INCREASE_STEP_DB
+        );
       }
       if (Math.abs(nextGainDb - this.gainDb) >= 0.05) {
-        const safetyLimited = this.safetyCeilingDb < this.longTermGainDb - 0.05;
         const timeConstant = nextGainDb < this.gainDb
-          ? safetyLimited ? 0.75 : 4
-          : 10;
+          ? 0.5
+          : 5;
         this.gainDb = nextGainDb;
         this.applyGain(this.gainDb, timeConstant);
       }
@@ -1405,7 +1557,7 @@
       }
       const sign = this.gainDb >= 0 ? "+" : "";
       if (this.adaptiveApplied) {
-        return `적응 ${sign}${this.gainDb.toFixed(1)}dB`;
+        return `맞춤 ${sign}${this.gainDb.toFixed(1)}dB`;
       }
       return `측정 ${Math.min(
         99,
@@ -1414,6 +1566,9 @@
     },
 
     tick() {
+      if (!settings.normalizeVolume && !settings.compressAudio) {
+        return;
+      }
       this.ensureGraph();
       if (
         !settings.normalizeVolume ||
@@ -1475,14 +1630,6 @@
         measuredAt,
         LOUDNESS_SHORT_WINDOW_MS
       );
-      core.appendTimedSample(
-        this.recentRenderedPeaks,
-        renderedPeak,
-        measuredAt,
-        LOUDNESS_PEAK_WINDOW_MS
-      );
-      this.applySafetyGain();
-
       if (Number.isFinite(this.shortTermLoudnessDb)) {
         core.appendTimedSample(
           this.shortTermLoudnessHistory,
@@ -1504,6 +1651,7 @@
         measuredAt,
         LOUDNESS_ANCHOR_WINDOW_MS
       );
+      this.applySafetyGain();
 
       const projectedPeak = renderedPeak * 10 ** (this.gainDb / 20);
       if (
@@ -1528,16 +1676,17 @@
           measuredAt,
           LOUDNESS_LONG_WINDOW_MS
         );
+        this.activeBlockCount = this.blockEnergies.length;
         return;
       }
       this.lastSignalAt = performance.now();
-      this.activeBlockCount += 1;
       core.appendTimedSample(
         this.blockEnergies,
         blockEnergy,
         measuredAt,
         LOUDNESS_LONG_WINDOW_MS
       );
+      this.activeBlockCount = this.blockEnergies.length;
 
       if (
         this.activeBlockCount >= LOUDNESS_INITIAL_BLOCKS &&
@@ -2075,6 +2224,9 @@
       if (!(video instanceof HTMLVideoElement) || video !== mainVideo()) {
         return;
       }
+      if (video === loudness.video) {
+        loudness.configureCompressor();
+      }
       volumeTooltip.show(video);
     },
 
@@ -2127,22 +2279,14 @@
         player?.classList?.contains("pzp-pc--onlive"),
         liveDistance
       );
-      const mode = playbackState.mode();
       const loudnessStatus = loudness.status();
-      const bufferAhead = core.bufferedAhead(video.buffered, video.currentTime);
       const element = this.ensureElement(anchor);
       const status = [];
       const details = [];
       if (atLiveEdge) {
-        status.push(mode ? `${mode} 자동` : "자동");
         status.push(`지연 ${liveDistance.toFixed(1)}초`);
         details.push(`지연: 현재 화면에서 실시간 위치까지 ${liveDistance.toFixed(1)}초`);
-      } else {
-        status.push(`LIVE까지 ${liveDistance.toFixed(1)}초`);
-        details.push(`LIVE까지 남은 시간: ${liveDistance.toFixed(1)}초`);
       }
-      status.push(`미리 받음 ${bufferAhead.toFixed(1)}초`);
-      details.push(`미리 받은 재생 분량: ${bufferAhead.toFixed(1)}초`);
       status.push(`음량 ${loudnessStatus}`);
       details.push(`음량 맞춤: ${loudnessStatus}`);
       element.textContent = status.join(" · ");
@@ -2159,37 +2303,53 @@
     return core.findChatMessageInReactElements(candidates);
   }
 
-  function contentText(content) {
+  function contentText(content, depth = 0, seen = new Set()) {
+    if (depth > 7) {
+      return "";
+    }
     if (typeof content === "string" || typeof content === "number") {
       return String(content);
     }
     if (Array.isArray(content)) {
       return content
-        .map((entry) => {
-          if (typeof entry === "string") {
-            return entry;
-          }
-          if (entry?.type === "text") {
-            return entry.value || "";
-          }
-          if (entry?.type === "emoji") {
-            return entry.name ? `{${entry.name}}` : "";
-          }
-          return "";
-        })
+        .map((entry) => contentText(entry, depth + 1, seen))
         .join("");
+    }
+    if (!content || typeof content !== "object" || seen.has(content)) {
+      return "";
+    }
+    seen.add(content);
+    if (content.type === "emoji") {
+      return content.name ? `{${content.name}}` : "";
+    }
+    for (const value of [
+      content.type === "text" ? content.value : undefined,
+      content.props?.children,
+      content.children,
+      content.text,
+      content.value,
+      content.props?.alt,
+      content.props?.title
+    ]) {
+      const text = contentText(value, depth + 1, seen);
+      if (text) {
+        return text;
+      }
     }
     return "";
   }
 
   const chatEnhancements = {
     originals: new Map(),
+    stableOriginals: new Map(),
+    itemRoutes: new WeakMap(),
     restoredNicknameStates: new WeakMap(),
     hasRestoredMessages: false,
     observer: null,
     scanTimer: null,
     scanInterval: null,
     verifyInterval: null,
+    cacheSaveTimer: null,
     waitingForBody: false,
     route: "",
 
@@ -2206,9 +2366,189 @@
       if (route === this.route) {
         return;
       }
+      this.persistOriginals();
+      clearTimeout(this.cacheSaveTimer);
+      this.cacheSaveTimer = null;
       this.route = route;
       this.originals.clear();
+      this.stableOriginals.clear();
+      this.loadOriginals();
       this.restoredNicknameStates = new WeakMap();
+    },
+
+    originalCacheStorageKey() {
+      return this.route ? `${BLIND_CACHE_STORAGE_PREFIX}${this.route}` : "";
+    },
+
+    loadOriginals() {
+      const storageKey = this.originalCacheStorageKey();
+      if (!storageKey || typeof sessionStorage === "undefined") {
+        return;
+      }
+      try {
+        const cached = JSON.parse(sessionStorage.getItem(storageKey) || "null");
+        if (!cached || typeof cached !== "object") {
+          sessionStorage.removeItem(storageKey);
+          return;
+        }
+        const now = Date.now();
+        const fallbackSeenAt = Number(cached.savedAt);
+        const exactEntries = Array.isArray(cached.exact) ? cached.exact : [];
+        const stableEntries = Array.isArray(cached.stable) ? cached.stable : [];
+        let shouldRewrite =
+          exactEntries.length > BLIND_CACHE_MAX_ENTRIES ||
+          stableEntries.length > BLIND_CACHE_MAX_ENTRIES;
+        for (const entry of exactEntries.slice(-BLIND_CACHE_MAX_ENTRIES)) {
+          if (!Array.isArray(entry)) {
+            shouldRewrite = true;
+            continue;
+          }
+          const [key, text, entrySeenAt] = entry;
+          const seenAt = Number(entrySeenAt ?? fallbackSeenAt);
+          if (
+            typeof key === "string" &&
+            typeof text === "string" &&
+            text &&
+            text.length <= BLIND_CACHE_MAX_TEXT_LENGTH &&
+            !core.isBlindChatPlaceholder(text) &&
+            this.cacheSeenAtIsFresh(seenAt, now)
+          ) {
+            this.originals.set(key, { text, seenAt });
+          } else {
+            shouldRewrite = true;
+          }
+        }
+        for (const entry of stableEntries.slice(-BLIND_CACHE_MAX_ENTRIES)) {
+          if (!Array.isArray(entry)) {
+            shouldRewrite = true;
+            continue;
+          }
+          const [key, text, entrySeenAt] = entry;
+          const seenAt = Number(entrySeenAt ?? fallbackSeenAt);
+          if (
+            typeof key === "string" &&
+            typeof text === "string" &&
+            text &&
+            text.length <= BLIND_CACHE_MAX_TEXT_LENGTH &&
+            !core.isBlindChatPlaceholder(text) &&
+            this.cacheSeenAtIsFresh(seenAt, now)
+          ) {
+            this.stableOriginals.set(key, { text, seenAt });
+          } else {
+            shouldRewrite = true;
+          }
+        }
+        if (!this.originals.size && !this.stableOriginals.size) {
+          sessionStorage.removeItem(storageKey);
+        } else if (shouldRewrite) {
+          this.persistOriginals();
+        }
+      } catch {
+        try {
+          sessionStorage.removeItem(storageKey);
+        } catch {}
+      }
+    },
+
+    persistOriginals() {
+      const storageKey = this.originalCacheStorageKey();
+      if (!storageKey || typeof sessionStorage === "undefined") {
+        return;
+      }
+      try {
+        this.pruneOriginals();
+        if (!this.originals.size && !this.stableOriginals.size) {
+          sessionStorage.removeItem(storageKey);
+          return;
+        }
+        sessionStorage.setItem(
+          storageKey,
+          JSON.stringify({
+            savedAt: Date.now(),
+            exact: Array.from(this.originals.entries())
+              .slice(-BLIND_CACHE_MAX_ENTRIES)
+              .map(([key, entry]) => [
+                key,
+                entry.text,
+                entry.seenAt
+              ]),
+            stable: Array.from(this.stableOriginals.entries())
+              .slice(-BLIND_CACHE_MAX_ENTRIES)
+              .map(([key, entry]) => [
+                key,
+                entry.text,
+                entry.seenAt
+              ])
+          })
+        );
+      } catch {}
+    },
+
+    scheduleOriginalCacheSave() {
+      if (this.cacheSaveTimer !== null) {
+        return;
+      }
+      this.cacheSaveTimer = setTimeout(() => {
+        this.cacheSaveTimer = null;
+        this.persistOriginals();
+      }, BLIND_CACHE_SAVE_DELAY_MS);
+    },
+
+    cacheSeenAtIsFresh(seenAt, now = Date.now()) {
+      return (
+        Number.isFinite(seenAt) &&
+        seenAt <= now + BLIND_CACHE_FUTURE_TOLERANCE_MS &&
+        now - seenAt <= BLIND_CACHE_MAX_AGE_MS
+      );
+    },
+
+    pruneOriginals(now = Date.now()) {
+      for (const [key, entry] of this.originals) {
+        if (!this.cacheSeenAtIsFresh(Number(entry.seenAt), now)) {
+          this.originals.delete(key);
+        }
+      }
+      for (const [key, entry] of this.stableOriginals) {
+        if (!this.cacheSeenAtIsFresh(Number(entry.seenAt), now)) {
+          this.stableOriginals.delete(key);
+        }
+      }
+    },
+
+    cachedOriginal(cache, key) {
+      if (!key || !cache.has(key)) {
+        return "";
+      }
+      const entry = cache.get(key);
+      if (!this.cacheSeenAtIsFresh(Number(entry.seenAt))) {
+        cache.delete(key);
+        this.scheduleOriginalCacheSave();
+        return "";
+      }
+      return entry.text || "";
+    },
+
+    clearOriginalCache() {
+      clearTimeout(this.cacheSaveTimer);
+      this.cacheSaveTimer = null;
+      try {
+        const storageKeys = new Set();
+        for (let index = 0; index < sessionStorage.length; index += 1) {
+          const key = sessionStorage.key(index);
+          if (key?.startsWith(BLIND_CACHE_STORAGE_PREFIX)) {
+            storageKeys.add(key);
+          }
+        }
+        const currentKey = this.originalCacheStorageKey();
+        if (currentKey) {
+          storageKeys.add(currentKey);
+        }
+        for (const key of storageKeys) {
+          sessionStorage.removeItem(key);
+        }
+      } catch {}
+      this.originals.clear();
+      this.stableOriginals.clear();
     },
 
     itemForElement(element, chatLog) {
@@ -2240,14 +2580,71 @@
       return items;
     },
 
-    remember(key, text) {
-      if (!key || !text || core.isBlindChatPlaceholder(text)) {
+    stableMessageKey(message) {
+      const user = String(message?.user || "");
+      const time = Number(message?.time);
+      return user && Number.isFinite(time) ? `${user}:${time}` : "";
+    },
+
+    remember(key, text, message) {
+      if (
+        !key ||
+        !text ||
+        text.length > BLIND_CACHE_MAX_TEXT_LENGTH ||
+        core.isBlindChatPlaceholder(text)
+      ) {
         return;
       }
-      this.originals.set(key, text);
-      if (this.originals.size > 2000) {
-        this.originals.delete(this.originals.keys().next().value);
+      const now = Date.now();
+      let changed = this.rememberOriginal(this.originals, key, text, now);
+      const stableKey = this.stableMessageKey(message);
+      if (stableKey) {
+        changed =
+          this.rememberOriginal(this.stableOriginals, stableKey, text, now) ||
+          changed;
       }
+      if (changed) {
+        this.scheduleOriginalCacheSave();
+      }
+    },
+
+    rememberOriginal(cache, key, text, now) {
+      const entry = cache.get(key);
+      const changed = entry?.text !== text;
+      const needsRefresh =
+        now - Number(entry?.seenAt || 0) >= BLIND_CACHE_SEEN_REFRESH_MS;
+      if (changed || needsRefresh) {
+        cache.set(key, { text, seenAt: now });
+      }
+      if (cache.size > BLIND_CACHE_MAX_ENTRIES) {
+        cache.delete(cache.keys().next().value);
+      }
+      return changed || needsRefresh;
+    },
+
+    directOriginal(message) {
+      for (const text of [
+        contentText(message?.originalContent),
+        contentText(message?.content)
+      ]) {
+        if (text && !core.isBlindChatPlaceholder(text)) {
+          return text;
+        }
+      }
+      return "";
+    },
+
+    recoverableOriginal(message, key) {
+      for (const text of [
+        this.directOriginal(message),
+        this.cachedOriginal(this.originals, key),
+        this.cachedOriginal(this.stableOriginals, this.stableMessageKey(message))
+      ]) {
+        if (text && !core.isBlindChatPlaceholder(text)) {
+          return text;
+        }
+      }
+      return "";
     },
 
     clearRestoredNickname(target) {
@@ -2349,6 +2746,8 @@
           }
         } else if (blindState === "visible") {
           this.clearRestoredMessage(target, { restorePlaceholder: false });
+        } else if (blindState === "blinded" && !visibleText) {
+          this.clearRestoredMessage(target);
         }
       }
 
@@ -2379,6 +2778,7 @@
         }
       }
       if (!settings.restoreBlindedMessages) {
+        this.clearOriginalCache();
         for (const target of document.querySelectorAll("[data-cng-blinded-restored]")) {
           this.clearRestoredMessage(target);
         }
@@ -2410,12 +2810,10 @@
       );
     },
 
-    blindStateForItem(item, message) {
+    blindStateForItem(item, message, key) {
       const officialState = core.chatMessageBlindState(message, "");
-      if (officialState === "visible") {
-        return "visible";
-      }
-      if (this.blindNoticeTarget(item)) {
+      const blindNotice = this.blindNoticeTarget(item);
+      if (blindNotice && this.recoverableOriginal(message, key)) {
         return "blinded";
       }
       const restoredTarget = item.querySelector(
@@ -2424,18 +2822,27 @@
       if (restoredTarget && this.hasNativeHiddenChatStyle(item)) {
         return "blinded";
       }
-      if (restoredTarget && officialState === "blinded") {
+      if (officialState === "visible") {
         return "visible";
       }
-      return "unknown";
+      if (blindNotice) {
+        return "blinded";
+      }
+      if (
+        restoredTarget &&
+        core.chatMessageStatus(message) === "CBOTBLIND" &&
+        restoredTarget.textContent === this.recoverableOriginal(message, key)
+      ) {
+        return "visible";
+      }
+      return officialState;
     },
 
     restoreBlinded(item, message, key, blindState) {
       if (!settings.restoreBlindedMessages || blindState !== "blinded") {
         return;
       }
-      const directOriginal = contentText(message.originalContent);
-      const original = directOriginal || this.originals.get(key);
+      const original = this.recoverableOriginal(message, key);
       if (!original) {
         return;
       }
@@ -2522,12 +2929,24 @@
         return;
       }
       const key = String(message.key || `${message.user || "chat"}-${message.time}`);
-      const blindState = this.blindStateForItem(item, message);
-      const original =
-        contentText(message.originalContent) || contentText(message.content);
+      const routeIdentity = this.stableMessageKey(message) || key;
+      const previousItemRoute = this.itemRoutes.get(item);
+      if (
+        previousItemRoute?.route !== this.route &&
+        previousItemRoute?.identity === routeIdentity
+      ) {
+        return;
+      }
+      this.itemRoutes.set(item, {
+        route: this.route,
+        identity: routeIdentity
+      });
+      const blindState = this.blindStateForItem(item, message, key);
+      const directOriginal = this.directOriginal(message);
+      const original = this.recoverableOriginal(message, key);
       this.cleanItemState(item, key, blindState, original);
       if (settings.restoreBlindedMessages) {
-        this.remember(key, original);
+        this.remember(key, directOriginal, message);
       }
       this.addTimestamp(item, message, key);
       this.restoreNickname(item, message, key);
@@ -2536,6 +2955,16 @@
 
     verifyRestoredMessages() {
       if (!settings.restoreBlindedMessages || !this.hasRestoredMessages) {
+        return;
+      }
+      this.ensureRoute();
+      if (!this.route) {
+        for (const target of document.querySelectorAll(
+          "[data-cng-blinded-restored]"
+        )) {
+          this.clearRestoredMessage(target);
+        }
+        this.hasRestoredMessages = false;
         return;
       }
       const targets = Array.from(
@@ -2556,10 +2985,24 @@
         const key = String(
           message.key || `${message.user || "chat"}-${message.time}`
         );
-        const blindState = this.blindStateForItem(item, message);
+        const routeIdentity = this.stableMessageKey(message) || key;
+        const previousItemRoute = this.itemRoutes.get(item);
+        if (
+          previousItemRoute?.route !== this.route &&
+          previousItemRoute?.identity === routeIdentity
+        ) {
+          this.clearRestoredMessage(target);
+          continue;
+        }
+        const blindState = this.blindStateForItem(item, message, key);
+        const original = this.recoverableOriginal(message, key);
         if (
           target.dataset.cngBlindedRestored !== key ||
-          blindState === "visible"
+          blindState === "visible" ||
+          (blindState === "blinded" &&
+            original &&
+            (target.textContent !== original ||
+              !target.classList.contains("cng-restored-message")))
         ) {
           this.processItem(item);
         }
@@ -2571,6 +3014,9 @@
         return;
       }
       this.ensureRoute();
+      if (!this.route) {
+        return;
+      }
       const logs = root.matches?.("[role='log']")
         ? [root]
         : Array.from(root.querySelectorAll?.("[role='log']") || []);
@@ -2682,6 +3128,9 @@
     disconnect() {
       clearTimeout(this.scanTimer);
       this.scanTimer = null;
+      clearTimeout(this.cacheSaveTimer);
+      this.cacheSaveTimer = null;
+      this.persistOriginals();
       this.observer?.disconnect();
       this.observer = null;
       if (this.scanInterval !== null) {
@@ -2693,6 +3142,9 @@
         this.verifyInterval = null;
       }
       this.originals.clear();
+      this.stableOriginals.clear();
+      this.itemRoutes = new WeakMap();
+      this.route = "";
       this.restoredNicknameStates = new WeakMap();
       this.hasRestoredMessages = false;
     },
@@ -2706,6 +3158,7 @@
     },
 
     start() {
+      window.addEventListener("pagehide", () => this.persistOriginals());
       this.setEnabled(this.enabled());
     }
   };
@@ -2759,11 +3212,11 @@
     settings = { ...settings, ...nextSettings };
     if (!settings.normalizeVolume) {
       loudness.disableNormalization();
-      loudness.configureLimiter(false);
     }
-    if (!settings.compressAudio) {
-      loudness.configureCompressor(false);
-    }
+    loudness.configureCompressor(settings.compressAudio);
+    loudness.configureLimiter(
+      settings.normalizeVolume || settings.compressAudio
+    );
     if (settings.normalizeVolume || settings.compressAudio) {
       loudness.ensureGraph();
     }

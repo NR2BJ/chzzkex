@@ -1,0 +1,150 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>CHZZK EX audio browser harness</title>
+<pre id="result">running</pre>
+<script src="../src/settings.js"></script>
+<script>
+  const sampleRate = 48000;
+  const durationSeconds = 1.5;
+
+  function db(linear) {
+    return 20 * Math.log10(Math.max(Number.EPSILON, linear));
+  }
+
+  function compressorMakeupTrimDb(thresholdDb, ratio) {
+    const fullScaleOutputDb = Math.min(0, thresholdDb) -
+      Math.min(0, thresholdDb) / ratio;
+    return fullScaleOutputDb * 0.6;
+  }
+
+  function measure(samples) {
+    const start = Math.floor(sampleRate * 0.75);
+    let sum = 0;
+    let peak = 0;
+    for (let index = start; index < samples.length; index += 1) {
+      const value = samples[index];
+      sum += value * value;
+      peak = Math.max(peak, Math.abs(value));
+    }
+    return {
+      rms: Math.sqrt(sum / (samples.length - start)),
+      peak
+    };
+  }
+
+  async function renderCompressor(amplitude, volume, preset) {
+    const context = new OfflineAudioContext(
+      1,
+      Math.round(sampleRate * durationSeconds),
+      sampleRate
+    );
+    const buffer = context.createBuffer(1, context.length, sampleRate);
+    const channel = buffer.getChannelData(0);
+    for (let index = 0; index < channel.length; index += 1) {
+      channel[index] = amplitude * volume *
+        Math.sin((2 * Math.PI * 440 * index) / sampleRate);
+    }
+
+    const source = context.createBufferSource();
+    const compressor = context.createDynamicsCompressor();
+    const trim = context.createGain();
+    const threshold = preset.thresholdDb + 20 * Math.log10(volume);
+    compressor.threshold.value = threshold;
+    compressor.knee.value = preset.kneeDb;
+    compressor.ratio.value = preset.ratio;
+    compressor.attack.value = preset.attackSeconds;
+    compressor.release.value = preset.releaseSeconds;
+    trim.gain.value = 10 ** (
+      (
+        compressorMakeupTrimDb(threshold, preset.ratio) -
+        compressorMakeupTrimDb(preset.thresholdDb, preset.ratio)
+      ) / 20
+    );
+    source.buffer = buffer;
+    source.connect(compressor).connect(trim).connect(context.destination);
+    source.start();
+    return measure((await context.startRendering()).getChannelData(0));
+  }
+
+  async function renderLimiter(amplitude) {
+    const context = new OfflineAudioContext(
+      1,
+      Math.round(sampleRate * durationSeconds),
+      sampleRate
+    );
+    const oscillator = context.createOscillator();
+    const input = context.createGain();
+    const limiter = context.createDynamicsCompressor();
+    const trim = context.createGain();
+    input.gain.value = amplitude;
+    limiter.threshold.value = -1;
+    limiter.knee.value = 0;
+    limiter.ratio.value = 20;
+    limiter.attack.value = 0;
+    limiter.release.value = 0.08;
+    trim.gain.value = 10 ** (compressorMakeupTrimDb(-1, 20) / 20);
+    oscillator.connect(input).connect(limiter).connect(trim).connect(
+      context.destination
+    );
+    oscillator.start();
+    return measure((await context.startRendering()).getChannelData(0));
+  }
+
+  const presets = globalThis.__CHZZK_EX_CONFIG__.COMPRESSOR_PRESETS;
+
+  (async () => {
+    const quietAmplitude = 0.02;
+    const loudAmplitude = 0.8;
+    const mediumQuietFull = await renderCompressor(
+      quietAmplitude,
+      1,
+      presets.medium
+    );
+    const mediumQuietHalf = await renderCompressor(
+      quietAmplitude,
+      0.5,
+      presets.medium
+    );
+    const mediumLoudFull = await renderCompressor(
+      loudAmplitude,
+      1,
+      presets.medium
+    );
+    const mediumLoudHalf = await renderCompressor(
+      loudAmplitude,
+      0.5,
+      presets.medium
+    );
+    const limiter = await renderLimiter(3);
+    const results = {
+      nativeMakeupDb: db(
+        mediumQuietFull.rms / (quietAmplitude / Math.sqrt(2))
+      ),
+      halfVolumeQuietDb: db(mediumQuietHalf.rms / mediumQuietFull.rms),
+      halfVolumeLoudDb: db(mediumLoudHalf.rms / mediumLoudFull.rms),
+      inputDynamicRangeDb: db(loudAmplitude / quietAmplitude),
+      compressedDynamicRangeDb: db(
+        mediumLoudFull.rms / mediumQuietFull.rms
+      ),
+      limiterPeakDb: db(limiter.peak)
+    };
+    results.pass =
+      results.nativeMakeupDb > 3 &&
+      results.nativeMakeupDb < 7 &&
+      Math.abs(results.halfVolumeQuietDb + 6.0206) < 0.25 &&
+      Math.abs(results.halfVolumeLoudDb + 6.0206) < 0.25 &&
+      results.compressedDynamicRangeDb < results.inputDynamicRangeDb - 4 &&
+      results.limiterPeakDb <= 0;
+    document.getElementById("result").textContent = JSON.stringify(
+      results,
+      null,
+      2
+    );
+    document.title = results.pass ? "PASS" : "FAIL";
+  })().catch((error) => {
+    document.getElementById("result").textContent = String(
+      error?.stack || error
+    );
+    document.title = "ERROR";
+  });
+</script>

@@ -132,43 +132,6 @@
       : null;
   }
 
-  function bufferedAhead(ranges, currentTime, toleranceSeconds = 0.05) {
-    const position = Number(currentTime);
-    const tolerance = Math.max(0, Number(toleranceSeconds) || 0);
-    if (!ranges?.length || !Number.isFinite(position)) {
-      return 0;
-    }
-
-    let ahead = 0;
-    for (let index = 0; index < ranges.length; index += 1) {
-      const start = Number(ranges.start(index));
-      const end = Number(ranges.end(index));
-      if (
-        Number.isFinite(start) &&
-        Number.isFinite(end) &&
-        end >= start &&
-        position >= start - tolerance &&
-        position <= end + tolerance
-      ) {
-        ahead = Math.max(ahead, end - position);
-      }
-    }
-    return Math.max(0, ahead);
-  }
-
-  function hasUsableNativeTimeline(candidates) {
-    return (Array.isArray(candidates) ? candidates : []).some(
-      ({ custom, display, visibility, width, height }) =>
-        !custom &&
-        display !== "none" &&
-        visibility !== "hidden" &&
-        Number.isFinite(width) &&
-        width > 40 &&
-        Number.isFinite(height) &&
-        height > 0
-    );
-  }
-
   const LOUDNESS_OFFSET_DB = -0.691;
 
   function loudnessDbFromEnergy(energy) {
@@ -240,6 +203,19 @@
     const fullScaleOutputDb = Math.min(0, thresholdDb) -
       Math.min(0, thresholdDb) / ratio;
     return fullScaleOutputDb * 0.6;
+  }
+
+  function compressorVolumeCompensationDb(thresholdDb, ratio, volume) {
+    const adjustedThresholdDb = compressorThresholdForMediaVolume(
+      thresholdDb,
+      volume
+    );
+    // Keep the browser's fixed soft-knee makeup. Only its threshold-shifted
+    // delta is removed; the knee term cancels while the knee end stays below 0 dB.
+    return (
+      compressorMakeupTrimDb(adjustedThresholdDb, ratio) -
+      compressorMakeupTrimDb(thresholdDb, ratio)
+    );
   }
 
   function meanSquareTail(samples, sampleCount) {
@@ -396,45 +372,13 @@
     };
   }
 
-  function normalizationGainDb({
-    loudnessDb,
-    targetDb = -14,
-    minimumDb = -60,
-    maximumDb = 12
-  }) {
-    if (!Number.isFinite(loudnessDb) || !Number.isFinite(targetDb)) {
-      return 0;
-    }
-    return clamp(targetDb - loudnessDb, minimumDb, maximumDb);
-  }
-
-  function normalizationAnchorConfirmed({
-    shortTermLoudnessDb,
-    medianLoudnessDb,
-    peakDb,
-    targetDb = -16,
-    targetMarginDb = 8,
-    activityMarginDb = 6,
-    peakThresholdDb = -12
-  }) {
-    const nearTarget =
-      Number.isFinite(shortTermLoudnessDb) &&
-      shortTermLoudnessDb >= targetDb - Math.max(0, targetMarginDb);
-    const foregroundContrast =
-      Number.isFinite(shortTermLoudnessDb) &&
-      Number.isFinite(medianLoudnessDb) &&
-      shortTermLoudnessDb - medianLoudnessDb >= Math.max(0, activityMarginDb);
-    const strongPeak =
-      Number.isFinite(peakDb) && peakDb >= peakThresholdDb;
-    return nearTarget || foregroundContrast || strongPeak;
-  }
-
   function hybridNormalizationGainDb({
     integratedLoudnessDb,
     shortTermLoudnessDb,
     peakDb,
     targetDb = -16,
     shortTermAllowanceDb = 4,
+    integratedCeilingAllowanceDb = 2,
     peakCeilingDb = -3,
     minimumDb = -60,
     maximumDb = 12,
@@ -447,8 +391,8 @@
     ) {
       return {
         gainDb: 0,
-        integratedGainDb: 0,
-        shortTermLimitDb: 0,
+        integratedGuardDb: 0,
+        loudPartGainDb: 0,
         peakLimitDb: 0,
         effectiveMaximumDb: 0
       };
@@ -458,17 +402,19 @@
     const effectiveMaximumDb = anchorConfirmed
       ? boundedMaximumDb
       : Math.min(boundedMaximumDb, Math.max(0, provisionalMaximumDb));
-    const integratedGainDb = targetDb - integratedLoudnessDb;
-    const shortTermLimitDb = Number.isFinite(shortTermLoudnessDb)
+    const integratedGuardDb =
+      targetDb + Math.max(0, integratedCeilingAllowanceDb) -
+      integratedLoudnessDb;
+    const loudPartGainDb = Number.isFinite(shortTermLoudnessDb)
       ? targetDb + shortTermAllowanceDb - shortTermLoudnessDb
-      : effectiveMaximumDb;
+      : targetDb - integratedLoudnessDb;
     const peakLimitDb = Number.isFinite(peakDb)
-      ? Math.max(0, peakCeilingDb - peakDb)
+      ? peakCeilingDb - peakDb
       : effectiveMaximumDb;
     const gainDb = clamp(
       Math.min(
-        integratedGainDb,
-        shortTermLimitDb,
+        integratedGuardDb,
+        loudPartGainDb,
         peakLimitDb,
         effectiveMaximumDb
       ),
@@ -478,20 +424,11 @@
 
     return {
       gainDb,
-      integratedGainDb,
-      shortTermLimitDb,
+      integratedGuardDb,
+      loudPartGainDb,
       peakLimitDb,
       effectiveMaximumDb
     };
-  }
-
-  function maximumPeakDb(peaks) {
-    const peak = (Array.isArray(peaks) ? peaks : []).reduce(
-      (maximum, value) =>
-        Number.isFinite(value) && value > maximum ? value : maximum,
-      0
-    );
-    return peak > 0 ? 20 * Math.log10(peak) : Number.NEGATIVE_INFINITY;
   }
 
   function percentilePeakDb(peaks, ratio = 0.99) {
@@ -509,20 +446,15 @@
 
   function normalizationSafetyCeilingDb({
     shortTermLoudnessDb,
-    renderedPeakDb,
     shortTermCeilingDb = -11,
-    peakCeilingDb = -3,
     minimumDb = -60,
     maximumDb = 12
   }) {
     const loudnessLimitedGainDb = Number.isFinite(shortTermLoudnessDb)
       ? shortTermCeilingDb - shortTermLoudnessDb
       : maximumDb;
-    const peakLimitedGainDb = Number.isFinite(renderedPeakDb)
-      ? Math.max(0, peakCeilingDb - renderedPeakDb)
-      : maximumDb;
     return clamp(
-      Math.min(loudnessLimitedGainDb, peakLimitedGainDb, maximumDb),
+      Math.min(loudnessLimitedGainDb, maximumDb),
       minimumDb,
       maximumDb
     );
@@ -730,10 +662,10 @@
     adaptiveLoudnessStats,
     appendTimedSample,
     biquadQDbFromLinear,
-    bufferedAhead,
     clamp,
     compressorMakeupTrimDb,
     compressorThresholdForMediaVolume,
+    compressorVolumeCompensationDb,
     chatMessageBlindState,
     chatMessageStatus,
     chatTextAfterRestoreCleanup,
@@ -746,7 +678,6 @@
     formatOffset,
     formatTimestamp,
     gatedLoudnessDb,
-    hasUsableNativeTimeline,
     hybridNormalizationGainDb,
     initialLiveSeekTarget,
     isBlindChatPlaceholder,
@@ -756,9 +687,6 @@
     maximumAbsoluteTail,
     meanSquareTail,
     timelineSeekTarget,
-    maximumPeakDb,
-    normalizationAnchorConfirmed,
-    normalizationGainDb,
     normalizationSafetyCeilingDb,
     percentile,
     percentilePeakDb,

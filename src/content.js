@@ -3,7 +3,6 @@
 
   const storage = chrome.storage;
   let settingsDefaults = null;
-  let statePromise = Promise.resolve({});
   storage.local.remove([
     "playbackFilter",
     "directPlayback",
@@ -29,8 +28,7 @@
       return;
     }
 
-    statePromise = storageGet(settingsDefaults);
-    const state = await statePromise;
+    const state = await storageGet(settingsDefaults);
     const settings = {};
     for (const key of Object.keys(settingsDefaults)) {
       settings[key] = state[key];

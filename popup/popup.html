@@ -19,7 +19,7 @@
       <section>
         <h2>재생</h2>
         <label class="toggle">
-          <span><strong>실시간 음량 맞춤</strong><small>플레이어 볼륨을 유지하고 방송 간 음량 차이 조정</small></span>
+          <span><strong>실시간 음량 맞춤</strong><small>플레이어 볼륨을 유지하고 방송의 큰 구간을 기준으로 조정</small></span>
           <input id="normalizeVolume" type="checkbox" role="switch">
         </label>
         <div id="normalizationTarget" class="number-setting">
@@ -37,7 +37,7 @@
           </label>
         </div>
         <label class="toggle">
-          <span><strong>다이내믹 압축</strong><small>큰 말소리와 게임 효과음을 완만하게 조정</small></span>
+          <span><strong>다이내믹 압축</strong><small>큰 소리를 눌러 작은 소리가 덜 묻히게 조정</small></span>
           <input id="compressAudio" type="checkbox" role="switch">
         </label>
         <div id="compressorPreset" class="preset-setting">
@@ -77,7 +77,7 @@
           <input id="chatTimestamp" type="checkbox" role="switch">
         </label>
         <label class="toggle">
-          <span><strong>재생 상태 표시</strong><small>LIVE까지 남은 시간, 미리 받은 분량, 음량 상태 표시</small></span>
+          <span><strong>재생 상태 표시</strong><small>실시간 지연과 음량 상태 표시</small></span>
           <input id="videoLatency" type="checkbox" role="switch">
         </label>
         <label class="toggle">
@@ -85,7 +85,7 @@
           <input id="restoreTransparentNicknames" type="checkbox" role="switch">
         </label>
         <label class="toggle">
-          <span><strong>블라인드 메시지 복구</strong><small>페이지에 남아 있는 원문만 복구</small></span>
+          <span><strong>블라인드 메시지 복구</strong><small>블라인드 전에 본 원문을 같은 탭에서 6시간 기억</small></span>
           <input id="restoreBlindedMessages" type="checkbox" role="switch">
         </label>
       </section>
