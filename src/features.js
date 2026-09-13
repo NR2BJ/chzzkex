@@ -1838,6 +1838,8 @@
     card: null,
     timer: null,
     hideTimer: null,
+    refreshTimer: null,
+    generation: 0,
     currentLink: null,
     controller: null,
     cache: new Map(),
@@ -1945,7 +1947,8 @@
       }
 
       this.controller?.abort();
-      this.controller = new AbortController();
+      const controller = new AbortController();
+      this.controller = controller;
       const paths = [
         `https://api.chzzk.naver.com/service/v3.3/channels/${channelId}/live-detail?dt=PC&tm=false`,
         `https://api.chzzk.naver.com/service/v3/channels/${channelId}/live-detail`
@@ -1954,9 +1957,13 @@
         try {
           const response = await fetch(path, {
             credentials: "include",
-            signal: this.controller.signal
+            cache: "no-cache",
+            signal: controller.signal
           });
           const payload = await response.json();
+          if (controller.signal.aborted) {
+            return null;
+          }
           if (payload?.content) {
             this.cache.set(channelId, { time: Date.now(), data: payload.content });
             if (this.cache.size > 100) {
@@ -1973,7 +1980,12 @@
       return null;
     },
 
-    async show(link) {
+    scheduleRefresh(link) {
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = setTimeout(() => this.show(link, true), 20000);
+    },
+
+    async show(link, refreshing = false) {
       if (!this.isCurrent(link)) {
         if (this.currentLink === link) {
           this.hide();
@@ -1986,19 +1998,22 @@
         return;
       }
 
+      clearTimeout(this.refreshTimer);
+      this.refreshTimer = null;
+      const generation = ++this.generation;
       this.position(link);
       const card = this.ensureCard();
-      card.classList.add("is-loading", "is-visible");
+      card.classList.add("is-visible");
       const image = card.querySelector(".cng-sidebar-preview__image");
-      image.removeAttribute("src");
-      card.querySelector(".cng-sidebar-preview__title").textContent =
-        this.fallbackTitle;
-      card.querySelector(".cng-sidebar-preview__meta").textContent = "";
+      if (!refreshing) {
+        card.classList.add("is-loading");
+        image.removeAttribute("src");
+        card.querySelector(".cng-sidebar-preview__title").textContent =
+          this.fallbackTitle;
+        card.querySelector(".cng-sidebar-preview__meta").textContent = "";
+      }
       const detail = await this.fetchDetail(channelId);
-      if (!detail) {
-        if (this.currentLink === link) {
-          this.hide();
-        }
+      if (generation !== this.generation) {
         return;
       }
       if (!this.isCurrent(link)) {
@@ -2007,10 +2022,23 @@
         }
         return;
       }
+      if (!detail) {
+        if (refreshing) {
+          this.scheduleRefresh(link);
+        } else {
+          this.hide();
+        }
+        return;
+      }
 
       const imageUrl = detail.liveImageUrl?.replace("{type}", "480") || "";
       if (imageUrl) {
-        image.src = imageUrl;
+        const refreshedUrl = new URL(imageUrl, location.href);
+        refreshedUrl.searchParams.set(
+          "_chzzk_ex",
+          String(this.cache.get(channelId)?.time ?? Date.now())
+        );
+        image.src = refreshedUrl.href;
       }
       card.querySelector(".cng-sidebar-preview__title").textContent =
         detail.liveTitle || this.fallbackTitle || detail.channel?.channelName || "";
@@ -2021,14 +2049,18 @@
           .filter(Boolean)
           .join(" · ");
       card.classList.remove("is-loading");
+      this.scheduleRefresh(link);
     },
 
     hide() {
       clearTimeout(this.timer);
       clearTimeout(this.hideTimer);
+      clearTimeout(this.refreshTimer);
+      this.generation += 1;
       this.controller?.abort();
       this.timer = null;
       this.hideTimer = null;
+      this.refreshTimer = null;
       this.controller = null;
       this.currentLink = null;
       this.fallbackTitle = "";
@@ -2077,14 +2109,8 @@
       if (link.contains(event.relatedTarget)) {
         return;
       }
-      const pointerX = event.clientX;
-      const pointerY = event.clientY;
       sidebarPreview.hideTimer = setTimeout(() => {
         if (sidebarPreview.currentLink !== link) {
-          return;
-        }
-        const hovered = document.elementFromPoint(pointerX, pointerY);
-        if (hovered && link.contains(hovered)) {
           return;
         }
         sidebarPreview.hide();

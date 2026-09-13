@@ -20,6 +20,7 @@ function createRuntime({
   nativeHidden,
   sessionStorageState = new Map(),
   dateNow = Date.now(),
+  fetch: fetchImplementation,
   nicknameStyle = {
     color: "rgb(20, 21, 23)",
     backgroundImage: "none",
@@ -432,6 +433,11 @@ function createRuntime({
   );
 
   const context = {
+    AbortController,
+    URL,
+    fetch: fetchImplementation,
+    innerWidth: 1920,
+    innerHeight: 1080,
     __windowListeners: windowListeners,
     clearTimeout(id) {
       timeoutCallbacks.delete(id);
@@ -1289,6 +1295,149 @@ test("keeps a sidebar preview alive across a quick same-link re-entry", () => {
     target: link
   });
   assert.equal(disabledPointerOut.propagationStopped, undefined);
+});
+
+test("refreshes the thumbnail URL after the sidebar detail cache expires", async () => {
+  const requests = [];
+  const runtime = createRuntime({
+    dateNow: 100000,
+    fetch: async (url, options) => {
+      requests.push({ url, options });
+      return {
+        json: async () => ({ content: {
+          liveImageUrl: "https://example.test/live_{type}.jpg?quality=80",
+          liveTitle: `Broadcast ${requests.length}`
+        } })
+      };
+    }
+  });
+  const link = runtime.addSidebarLink();
+  runtime.dispatchSettings({ sidebarPreview: true });
+  async function reopen(at) {
+    runtime.dispatchDocumentEvent("click", { target: link });
+    runtime.setDateNow(at);
+    runtime.dispatchDocumentEvent("pointerover", { target: link });
+    runtime.flushTimeouts(250);
+    await new Promise((resolve) => setImmediate(resolve));
+    return runtime.document.querySelector(".cng-sidebar-preview__image").src;
+  }
+
+  const first = await reopen(100000);
+  assert.equal(await reopen(119999), first);
+  assert.equal(requests.length, 1);
+  const refreshed = await reopen(120000);
+  assert.notEqual(refreshed, first);
+  assert.equal(requests.length, 2);
+  assert.equal(requests[1].options.cache, "no-cache");
+  assert.equal(new URL(refreshed).pathname, "/live_480.jpg");
+  assert.equal(new URL(refreshed).searchParams.get("quality"), "80");
+  assert.equal(new URL(refreshed).searchParams.get("_chzzk_ex"), "120000");
+  assert.equal(runtime.document.querySelector(".cng-sidebar-preview__title").textContent,
+    "Broadcast 2");
+});
+
+test("refreshes a visible sidebar preview and stops refreshing after navigation", async () => {
+  let requests = 0;
+  const runtime = createRuntime({
+    dateNow: 100000,
+    fetch: async () => {
+      requests += 1;
+      return { json: async () => ({ content: {
+        liveImageUrl: "https://example.test/live_{type}.jpg",
+        liveTitle: `Broadcast ${requests}`
+      } }) };
+    }
+  });
+  const link = runtime.addSidebarLink();
+  runtime.dispatchSettings({ sidebarPreview: true });
+  runtime.dispatchDocumentEvent("pointerover", { target: link });
+  runtime.flushTimeouts(250);
+  await new Promise((resolve) => setImmediate(resolve));
+  const card = runtime.document.querySelector(".cng-sidebar-preview");
+  const image = card.querySelector("img");
+  const first = image.src;
+  assert.equal(runtime.pendingTimeouts(20000), 1);
+
+  runtime.setDateNow(120000);
+  runtime.flushTimeouts(20000);
+  assert.equal(image.src, first, "keep the previous image while refreshing");
+  assert.equal(card.classList.contains("is-loading"), false);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests, 2);
+  assert.notEqual(image.src, first);
+  assert.equal(runtime.pendingTimeouts(20000), 1);
+
+  runtime.dispatchWindowEvent("pagehide");
+  assert.equal(runtime.pendingTimeouts(20000), 0);
+  assert.equal(card.classList.contains("is-visible"), false);
+});
+
+test("does not keep a departed sidebar link active from stale pointerout coordinates", async () => {
+  let requests = 0;
+  const runtime = createRuntime({
+    dateNow: 100000,
+    fetch: async () => {
+      requests += 1;
+      return { json: async () => ({ content: {
+        liveImageUrl: "https://example.test/live_{type}.jpg"
+      } }) };
+    }
+  });
+  const link = runtime.addSidebarLink();
+  runtime.document.elementFromPoint = () => link;
+  runtime.dispatchSettings({ sidebarPreview: true });
+  runtime.dispatchDocumentEvent("pointerover", { target: link });
+  runtime.flushTimeouts(250);
+  await new Promise((resolve) => setImmediate(resolve));
+  const card = runtime.document.querySelector(".cng-sidebar-preview");
+  const first = card.querySelector("img").src;
+  runtime.dispatchDocumentEvent("pointerout", {
+    target: link, relatedTarget: runtime.document.body, clientX: 1, clientY: 1
+  });
+  runtime.flushTimeouts(120);
+  assert.equal(card.classList.contains("is-visible"), false);
+  assert.equal(runtime.pendingTimeouts(20000), 0);
+
+  runtime.setDateNow(125000);
+  runtime.dispatchDocumentEvent("pointerover", { target: link });
+  runtime.flushTimeouts(250);
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(requests, 2);
+  assert.notEqual(card.querySelector("img").src, first);
+});
+
+test("ignores an old refresh response after leaving and reopening the same channel", async () => {
+  let requests = 0;
+  let completeOldRefresh;
+  const runtime = createRuntime({
+    dateNow: 100000,
+    fetch: async () => {
+      const number = ++requests;
+      return { json: () => number === 2
+        ? new Promise((resolve) => { completeOldRefresh = resolve; })
+        : Promise.resolve({ content: {
+          liveImageUrl: "https://example.test/live_{type}.jpg",
+          liveTitle: `Broadcast ${number}`
+        } }) };
+    }
+  });
+  const link = runtime.addSidebarLink();
+  runtime.dispatchSettings({ sidebarPreview: true });
+  runtime.dispatchDocumentEvent("pointerover", { target: link });
+  runtime.flushTimeouts(250);
+  await new Promise((resolve) => setImmediate(resolve));
+  runtime.setDateNow(120000);
+  runtime.flushTimeouts(20000);
+  await new Promise((resolve) => setImmediate(resolve));
+  runtime.dispatchDocumentEvent("click", { target: link });
+  runtime.dispatchDocumentEvent("pointerover", { target: link });
+  runtime.flushTimeouts(250);
+  await new Promise((resolve) => setImmediate(resolve));
+  completeOldRefresh({ content: { liveTitle: "Obsolete response" } });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(runtime.document.querySelector(".cng-sidebar-preview__title").textContent,
+    "Broadcast 3");
+  assert.equal(runtime.pendingTimeouts(20000), 1);
 });
 
 test("leaves rewind distance to the fallback timeline", () => {
