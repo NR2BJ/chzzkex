@@ -3,11 +3,16 @@
   "name": "CHZZK EX",
   "short_name": "CHZZK EX",
   "description": "Playback, navigation, and chat conveniences for CHZZK.",
-  "version": "1.0.17",
+  "version": "1.0.18",
   "permissions": [
     "declarativeNetRequest",
-    "storage"
+    "storage",
+    "alarms"
   ],
+  "background": {
+    "scripts": ["src/background.js"],
+    "service_worker": "src/background.js"
+  },
   "host_permissions": [
     "https://chzzk.naver.com/*",
     "https://*.chzzk.naver.com/*",
@@ -21,7 +26,8 @@
         "https://*.chzzk.naver.com/*"
       ],
       "js": [
-        "src/content.js"
+        "src/content.js",
+        "src/live-resume.js"
       ],
       "run_at": "document_start"
     },

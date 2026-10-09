@@ -25,6 +25,7 @@ test("keeps one complete immutable settings definition", () => {
     "restoreTransparentNicknames",
     "restoreBlindedMessages",
     "autoClaimPower",
+    "autoResumeLive",
     "debug"
   ]);
   assert.equal(Object.isFrozen(config.DEFAULT_SETTINGS), true);

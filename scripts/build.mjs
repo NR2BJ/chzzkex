@@ -17,7 +17,7 @@ const rootDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..")
 const distDir = path.join(rootDir, "dist");
 const stageDir = path.join(distDir, ".stage");
 const runtimeEntries = ["NOTICE.md", "popup", "rules", "src"];
-const contentBundleSources = ["src/content.js"];
+const contentBundleSources = ["src/content.js", "src/live-resume.js"];
 const mainBundleSources = [
   "src/settings.js",
   "src/rewrite-core.js",
@@ -80,6 +80,9 @@ async function stageRuntime(browser) {
   }
   if (browser === "chrome") {
     delete browserManifest.browser_specific_settings;
+    delete browserManifest.background.scripts;
+  } else {
+    delete browserManifest.background.service_worker;
   }
 
   await writeFile(

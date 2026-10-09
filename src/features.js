@@ -3273,6 +3273,14 @@
     if (
       event.source === window &&
       event.data?.source === MESSAGE_SOURCE &&
+      event.data?.type === "automation-tick"
+    ) {
+      powerClaim.tick();
+      return;
+    }
+    if (
+      event.source === window &&
+      event.data?.source === MESSAGE_SOURCE &&
       event.data?.type === "settings"
     ) {
       applySettings(event.data.settings);

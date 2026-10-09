@@ -55,6 +55,7 @@
     restoreTransparentNicknames: true,
     restoreBlindedMessages: true,
     autoClaimPower: true,
+    autoResumeLive: true,
     debug: false
   });
 
