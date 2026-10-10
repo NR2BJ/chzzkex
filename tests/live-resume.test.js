@@ -26,7 +26,7 @@ function storage(data = {}) {
   };
 }
 
-function backgroundRuntime({ session = {}, tabs, status = "CLOSE" } = {}) {
+function backgroundRuntime({ session = {}, tabs, status = "CLOSE", ended = false } = {}) {
   const calls = { reload: [], update: [], messages: [], fetch: [] };
   const tabMap = new Map((tabs || [{ id: 1, url: liveUrl(), status: "complete", active: false, mutedInfo: { muted: false } }]).map((tab) => [tab.id, tab]));
   let response = { code: 200, content: { status, liveId: 100 } };
@@ -44,7 +44,10 @@ function backgroundRuntime({ session = {}, tabs, status = "CLOSE" } = {}) {
         tabMap.get(id).mutedInfo = { muted: changes.muted, extensionId: api.runtime.id };
       },
       async reload(id) { calls.reload.push(id); },
-      async sendMessage(id, message) { calls.messages.push([id, message]); }
+      async sendMessage(id, message) {
+        calls.messages.push([id, message]);
+        if (message.type === "live-page-state") return { channelId: "streamer", ended };
+      }
     }
   };
   vm.runInNewContext(background, {
@@ -100,6 +103,35 @@ test("does not reload or mute an already open broadcast on initial observation",
   assert.equal(r.calls.reload.length, 0);
   assert.equal(r.calls.update.length, 0);
   assert.ok(r.calls.messages.some(([, message]) => message.type === "automation-tick"));
+});
+
+test("recovers an ended page even when the first API observation is already OPEN", async () => {
+  const r = backgroundRuntime({ status: "OPEN", ended: true });
+  await flush();
+  assert.deepEqual(r.calls.reload, [1]);
+  await r.tick();
+  assert.deepEqual(r.calls.reload, [1]);
+});
+
+test("recovers an ended page whose saved live ID already matches the server", async () => {
+  const r = backgroundRuntime({ status: "OPEN", ended: true, session: {
+    "live-watch:1": { channelId: "streamer", status: "OPEN", liveId: "100" }
+  } });
+  await flush();
+  assert.deepEqual(r.calls.reload, [1]);
+});
+
+test("limits ended-page recovery to two attempts per broadcast with a cooldown", async () => {
+  const r = backgroundRuntime({ status: "OPEN", ended: true });
+  await flush();
+  await r.tick();
+  assert.deepEqual(r.calls.reload, [1]);
+  r.api.storage.session.data["live-watch:1"].lastResumeAt = Date.now() - 120001;
+  await r.tick();
+  assert.deepEqual(r.calls.reload, [1, 1]);
+  r.api.storage.session.data["live-watch:1"].lastResumeAt = Date.now() - 120001;
+  await r.tick();
+  assert.deepEqual(r.calls.reload, [1, 1]);
 });
 
 test("retains waiting state across background shutdown and groups identical channel requests", async () => {
@@ -234,7 +266,7 @@ test("a rapid new broadcast does not inherit the previous temporary tab mute", a
   assert.equal(r.tabMap.get(1).mutedInfo.muted, false);
 });
 
-function contentRuntime({ resume = { channelId: "streamer", token: "101:0" } } = {}) {
+function contentRuntime({ resume = { channelId: "streamer", token: "101:0" }, players = [] } = {}) {
   const messages = [], intervals = new Map(), listeners = new Map();
   const observers = [];
   const video = {
@@ -253,11 +285,39 @@ function contentRuntime({ resume = { channelId: "streamer", token: "101:0" } } =
     setInterval(fn) { const id = Symbol(); intervals.set(id, fn); return id; },
     clearInterval(id) { intervals.delete(id); },
     MutationObserver: class { constructor(fn) { this.fn = fn; observers.push(this); } observe() {} disconnect() { this.stopped = true; } },
-    document: { querySelectorAll() { return videos; }, addEventListener(name, fn) { listeners.set(name, fn); } },
+    getComputedStyle: (node) => ({ visibility: node.visibility || "visible" }),
+    document: { visibilityState: "visible", querySelectorAll(selector) { return selector === "video" ? videos : players; }, addEventListener(name, fn) { listeners.set(name, fn); } },
     window: { addEventListener(name, fn) { listeners.set(name, fn); }, postMessage() {} }
   });
   return { api, location, video, messages, intervals, observers, listeners, setVideos(next) { videos = next; } };
 }
+
+test("reports only visible player end notices, not pauses or hidden notices", async () => {
+  const notice = (textContent, visible = true) => ({ textContent, getClientRects: () => visible ? [{}] : [], closest: () => null });
+  for (const [messages, ended] of [
+    [[notice("라이브 종료"), notice("다음 방송에서 만나요!")], true],
+    [[notice("다음 라이브를 기대해 주세요!")], true],
+    [[notice("다음 라이브를 기대해 주세요!", false)], false],
+    [[notice("일시정지")], false],
+    [[notice("방송 정보를 불러오는 중")], false],
+    [[notice("광고 차단 중이신가요?")], false]
+  ]) {
+    const r = contentRuntime({ resume: null, players: [{ querySelectorAll: () => messages }] });
+    await flush();
+    let response;
+    r.api.runtime.onMessage.emit({ type: "live-page-state" }, {}, (value) => { response = value; });
+    assert.equal(response.channelId, "streamer");
+    assert.equal(response.ended, ended);
+  }
+});
+
+test("requests a throttled fresh check when returning to a live tab", async () => {
+  const r = contentRuntime({ resume: null });
+  await flush();
+  r.listeners.get("focus")();
+  r.listeners.get("visibilitychange")();
+  assert.equal(r.messages.filter((message) => message.type === "check-live").length, 1);
+});
 
 test("starts muted in the background and only acknowledges actual playback progress", async () => {
   const r = contentRuntime();

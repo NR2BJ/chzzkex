@@ -3,8 +3,10 @@
   const ALARM = "chzzk-ex-live-check";
   const PREFIX = "live-watch:";
   const RESUME_TIMEOUT = 5 * 60 * 1000;
+  const RETRY_DELAY = 2 * 60 * 1000;
   let queue = Promise.resolve();
   let checking = false;
+  let lastFocusCheck = 0;
 
   function channelFromUrl(value) {
     try {
@@ -119,20 +121,40 @@
       }
     }
     if (!status) return;
+    let ended = false;
+    if (status.status === "OPEN") {
+      let timer;
+      try {
+        const page = await Promise.race([
+          api.tabs.sendMessage(tab.id, { type: "live-page-state" }),
+          new Promise((resolve) => { timer = setTimeout(() => resolve(null), 2000); })
+        ]);
+        ended = page?.channelId === channelId && page.ended === true;
+      } catch {
+        // 페이지에 연결할 수 없다는 이유만으로 재생을 중단하지 않는다.
+      } finally {
+        clearTimeout(timer);
+      }
+    }
     const changed = state && status.status === "OPEN" &&
       (state.status === "CLOSE" || state.liveId !== status.liveId) &&
       state.resumedLiveId !== status.liveId;
+    const attempts = state?.resumedLiveId === status.liveId ? state.resumeAttempts || 1 : 0;
+    const recoverEnded = ended && attempts < 2 &&
+      (!attempts || Date.now() - (state.lastResumeAt || state.pending?.since || 0) >= RETRY_DELAY);
     const next = { ...state, channelId, ...status };
-    if (changed) {
-      if (state.pending) {
+    if (changed || recoverEnded) {
+      if (state?.pending) {
         await releaseMute(tab.id, state.pending);
         delete next.pending;
       }
       const freshTab = await currentTab(tab.id, channelId);
       if (!freshTab || freshTab.status === "loading") return;
       if (!(await api.storage.local.get({ autoResumeLive: true })).autoResumeLive) return;
-      // 새 방송 하나당 한 번만 새로고침하며, 응답이 늦어도 먼저 기록한다.
+      // 종료 화면이 남은 경우에만 제한적으로 재시도하며 먼저 횟수를 기록한다.
       next.resumedLiveId = status.liveId;
+      next.resumeAttempts = attempts + 1;
+      next.lastResumeAt = Date.now();
       next.pending = {
         token: `${status.liveId}:${Date.now()}`,
         since: Date.now(),
@@ -209,6 +231,15 @@
   }
 
   api.runtime.onMessage.addListener((message, sender, sendResponse) => {
+    if (message?.type === "check-live" && sender.frameId === 0 &&
+      sender.tab && channelFromUrl(sender.url)) {
+      if (Date.now() - lastFocusCheck >= 30000) {
+        lastFocusCheck = Date.now();
+        requestCheck();
+      }
+      sendResponse({ ok: true });
+      return false;
+    }
     if (!["resume-state", "resume-started", "resume-cancel"].includes(message?.type)) return false;
     enqueue(() => handleMessage(message, sender)).then(sendResponse, () => sendResponse(null));
     return true;
