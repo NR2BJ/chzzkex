@@ -796,6 +796,107 @@ test("uses one stable offset and a separate live button in the fallback timeline
   assert.equal(track.getAttribute("aria-valuetext"), "실시간 1초 전");
 });
 
+function pausedRewindRuntime() {
+  const runtime = createRuntime();
+  const seekable = [[0, 100]];
+  const { player, video } = runtime.addPlayer({ seekable });
+  runtime.dispatchSettings({ timelineAssist: true });
+  mountTimeline(runtime);
+  const timeline = player.querySelector(".cng-timeline-assist");
+  const track = timeline.querySelector(".cng-timeline-assist__track");
+  runtime.dispatchDocumentEvent("keydown", { key: "ArrowLeft", target: track });
+  video.currentTime = 70;
+  video.paused = true;
+  runtime.dispatchDocumentEvent("pause", { target: video });
+  return { runtime, video, player, timeline, track, seekable };
+}
+
+test("resumes at the saved live offset instead of the paused absolute time", () => {
+  const { runtime, video, timeline, seekable } = pausedRewindRuntime();
+  runtime.setNow(20000);
+  seekable[0] = [20, 120];
+  runtime.runIntervals(250);
+  assert.equal(timeline.querySelector(".cng-timeline-assist__position").textContent, "-00:30");
+  assert.equal(video.currentTime, 70);
+  video.paused = false;
+  runtime.dispatchDocumentEvent("play", { target: video });
+  video.currentTime = 120; // 기본 플레이어의 재개 시 실시간 이동.
+  runtime.flushTimeouts(0);
+  assert.equal(video.currentTime, 90);
+  runtime.runIntervals(250);
+  assert.equal(timeline.querySelector(".cng-timeline-assist__position").textContent, "-00:30");
+  runtime.dispatchDocumentEvent("play", { target: video });
+  video.currentTime = 95;
+  runtime.flushTimeouts(0);
+  assert.equal(video.currentTime, 95, "한 번만 보정한다");
+});
+
+test("updates the saved offset when seeking again while paused", () => {
+  const { runtime, video, track, seekable } = pausedRewindRuntime();
+  runtime.dispatchDocumentEvent("keydown", { key: "ArrowLeft", target: track });
+  runtime.setNow(20000);
+  seekable[0] = [20, 120];
+  video.paused = false;
+  runtime.dispatchDocumentEvent("play", { target: video });
+  video.currentTime = 120;
+  runtime.flushTimeouts(0);
+  assert.equal(video.currentTime, 85);
+});
+
+test("does not restore a paused offset after cancellation or player replacement", () => {
+  for (const action of ["live", "disabled", "route", "video", "source", "pause-again", "seek"]) {
+    const { runtime, video, player, timeline, track } = pausedRewindRuntime();
+    video.paused = false;
+    runtime.dispatchDocumentEvent("play", { target: video });
+    video.currentTime = 99;
+    if (action === "live") {
+      runtime.dispatchDocumentEvent("click", { target: timeline.querySelector(".cng-timeline-assist__live") });
+    } else if (action === "disabled") {
+      runtime.dispatchSettings({ timelineAssist: false });
+    } else if (action === "route") {
+      runtime.setLocation("/live/other");
+    } else if (action === "video") {
+      player.remove();
+      runtime.addPlayer();
+    } else if (action === "source") {
+      video.currentSrc = "https://example.test/other.m3u8";
+    } else if (action === "pause-again") {
+      video.paused = true;
+      runtime.dispatchDocumentEvent("pause", { target: video });
+    } else {
+      runtime.dispatchDocumentEvent("keydown", { key: "ArrowLeft", target: track });
+    }
+    const currentTime = video.currentTime;
+    runtime.flushTimeouts(0);
+    assert.equal(video.currentTime, currentTime, action);
+  }
+});
+
+test("leaves ordinary LIVE pause and resume alone", () => {
+  const runtime = createRuntime();
+  const { video } = runtime.addPlayer();
+  runtime.dispatchSettings({ timelineAssist: true });
+  mountTimeline(runtime);
+  video.paused = true;
+  runtime.dispatchDocumentEvent("pause", { target: video });
+  video.paused = false;
+  runtime.dispatchDocumentEvent("play", { target: video });
+  video.currentTime = 100;
+  runtime.flushTimeouts(0);
+  assert.equal(video.currentTime, 100);
+});
+
+test("clamps a saved offset to the remaining seekable window", () => {
+  const { runtime, video, seekable } = pausedRewindRuntime();
+  runtime.setNow(20000);
+  seekable[0] = [100, 120];
+  video.paused = false;
+  runtime.dispatchDocumentEvent("play", { target: video });
+  video.currentTime = 120;
+  runtime.flushTimeouts(0);
+  assert.equal(video.currentTime, 100);
+});
+
 test("keeps custom timeline interaction and layout rules separated", () => {
   assert.match(
     featureCss,

@@ -3,7 +3,7 @@
   "name": "CHZZK EX",
   "short_name": "CHZZK EX",
   "description": "Playback, navigation, and chat conveniences for CHZZK.",
-  "version": "1.0.19",
+  "version": "1.0.21",
   "permissions": [
     "declarativeNetRequest",
     "storage",
@@ -20,6 +20,12 @@
     "https://apis.naver.com/*"
   ],
   "content_scripts": [
+    {
+      "matches": ["https://chzzk.naver.com/clip-editor", "https://chzzk.naver.com/clip-editor?*"],
+      "js": ["src/firefox-clip-editor.js"],
+      "run_at": "document_start",
+      "world": "MAIN"
+    },
     {
       "matches": [
         "https://chzzk.naver.com/*",

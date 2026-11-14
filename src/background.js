@@ -8,6 +8,16 @@
   let checking = false;
   let lastFocusCheck = 0;
 
+  async function sendToTab(tabId, message) {
+    let timer;
+    try {
+      return await Promise.race([
+        api.tabs.sendMessage(tabId, message),
+        new Promise((resolve) => { timer = setTimeout(() => resolve(null), 2000); })
+      ]);
+    } catch { return null; } finally { clearTimeout(timer); }
+  }
+
   function channelFromUrl(value) {
     try {
       const url = new URL(value);
@@ -113,34 +123,26 @@
         delete state.pending;
         await writeState(tab.id, state);
       } else {
-        await api.tabs.sendMessage(tab.id, {
+        await sendToTab(tab.id, {
           type: "resume-live",
           channelId,
           token: state.pending.token
-        }).catch(() => {});
+        });
       }
     }
     if (!status) return;
     let ended = false;
-    if (status.status === "OPEN") {
-      let timer;
-      try {
-        const page = await Promise.race([
-          api.tabs.sendMessage(tab.id, { type: "live-page-state" }),
-          new Promise((resolve) => { timer = setTimeout(() => resolve(null), 2000); })
-        ]);
-        ended = page?.channelId === channelId && page.ended === true;
-      } catch {
-        // 페이지에 연결할 수 없다는 이유만으로 재생을 중단하지 않는다.
-      } finally {
-        clearTimeout(timer);
-      }
+    let page = null;
+    if (status.status === "OPEN" && !tab.discarded) {
+      page = await sendToTab(tab.id, { type: "live-page-state" });
+      if (page?.channelId !== channelId) page = null;
+      ended = page?.ended === true;
     }
-    const changed = state && status.status === "OPEN" &&
+    const changed = ["OPEN", "CLOSE"].includes(state?.status) && status.status === "OPEN" &&
       (state.status === "CLOSE" || state.liveId !== status.liveId) &&
       state.resumedLiveId !== status.liveId;
     const attempts = state?.resumedLiveId === status.liveId ? state.resumeAttempts || 1 : 0;
-    const recoverEnded = ended && attempts < 2 &&
+    const recoverEnded = (ended || tab.discarded === true) && status.status === "OPEN" && attempts < 2 &&
       (!attempts || Date.now() - (state.lastResumeAt || state.pending?.since || 0) >= RETRY_DELAY);
     const next = { ...state, channelId, ...status };
     if (changed || recoverEnded) {
@@ -194,7 +196,7 @@
     }
     if (settings.autoClaimPower) {
       await Promise.all(liveTabs.map((tab) =>
-        api.tabs.sendMessage(tab.id, { type: "automation-tick" }).catch(() => {})
+        sendToTab(tab.id, { type: "automation-tick" })
       ));
     }
     if (!settings.autoResumeLive) return;
@@ -202,7 +204,11 @@
     const statuses = new Map(await Promise.all(channels.map(async (id) => [id, await liveStatus(id)])));
     for (const tab of liveTabs) {
       const channelId = channelFromUrl(tab.url);
-      await checkTab(tab, channelId, statuses.get(channelId));
+      try {
+        await checkTab(tab, channelId, statuses.get(channelId));
+      } catch {
+        // 한 탭이 사라지거나 응답에 실패해도 다른 채널 확인을 계속한다.
+      }
     }
   }
 
@@ -259,6 +265,7 @@
     if (area === "local" && changes.autoResumeLive) requestCheck();
   });
   async function start() {
+    await api.storage.local.remove("liveDiagnostics").catch(() => {});
     if (!await api.alarms.get(ALARM)) {
       await api.alarms.create(ALARM, { periodInMinutes: 1 });
     }

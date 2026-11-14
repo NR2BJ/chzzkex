@@ -72,13 +72,16 @@ async function stageRuntime(browser) {
 
   const browserManifest = JSON.parse(JSON.stringify(manifest));
   for (const contentScript of browserManifest.content_scripts || []) {
-    if (contentScript.world === "MAIN") {
+    if (contentScript.js?.includes("src/features.js")) {
       contentScript.js = ["src/main-bundle.js"];
     } else if (contentScript.js?.includes("src/content.js")) {
       contentScript.js = ["src/content-bundle.js"];
     }
   }
   if (browser === "chrome") {
+    browserManifest.content_scripts = browserManifest.content_scripts.filter(
+      (entry) => !entry.js.includes("src/firefox-clip-editor.js")
+    );
     delete browserManifest.browser_specific_settings;
     delete browserManifest.background.scripts;
   } else {

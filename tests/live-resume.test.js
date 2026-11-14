@@ -26,13 +26,13 @@ function storage(data = {}) {
   };
 }
 
-function backgroundRuntime({ session = {}, tabs, status = "CLOSE", ended = false } = {}) {
+function backgroundRuntime({ session = {}, local = {}, tabs, status = "CLOSE", ended = false, messageHandler, shortTimeout = false } = {}) {
   const calls = { reload: [], update: [], messages: [], fetch: [] };
   const tabMap = new Map((tabs || [{ id: 1, url: liveUrl(), status: "complete", active: false, mutedInfo: { muted: false } }]).map((tab) => [tab.id, tab]));
   let response = { code: 200, content: { status, liveId: 100 } };
   let fetchOverride;
   const api = {
-    storage: { local: storage(), session: storage(session), onChanged: event() },
+    storage: { local: storage(local), session: storage(session), onChanged: event() },
     runtime: { id: "extension-id", onMessage: event(), onStartup: event(), onInstalled: event() },
     alarms: { onAlarm: event(), async get() { return null; }, async create(name, opts) { calls.alarm = { name, ...opts }; } },
     tabs: {
@@ -46,12 +46,13 @@ function backgroundRuntime({ session = {}, tabs, status = "CLOSE", ended = false
       async reload(id) { calls.reload.push(id); },
       async sendMessage(id, message) {
         calls.messages.push([id, message]);
-        if (message.type === "live-page-state") return { channelId: "streamer", ended };
+        if (messageHandler) return messageHandler(id, message);
+        if (message.type === "live-page-state") return { channelId: tabMap.get(id).url.split("/").at(-1), ended };
       }
     }
   };
   vm.runInNewContext(background, {
-    chrome: api, URL, AbortController, setTimeout, clearTimeout, console,
+    chrome: api, URL, AbortController, setTimeout: shortTimeout ? (fn, ms) => setTimeout(fn, ms === 2000 ? 5 : ms) : setTimeout, clearTimeout, console,
     fetch: async (url, options) => {
       calls.fetch.push([url, options]);
       if (fetchOverride) return fetchOverride(url);
@@ -132,6 +133,75 @@ test("limits ended-page recovery to two attempts per broadcast with a cooldown",
   r.api.storage.session.data["live-watch:1"].lastResumeAt = Date.now() - 120001;
   await r.tick();
   assert.deepEqual(r.calls.reload, [1, 1]);
+});
+
+test("recovers discarded live tabs without needing an ended-page reply", async () => {
+  const r = backgroundRuntime({ status: "OPEN", tabs: [
+    { id: 1, url: liveUrl(), status: "complete", discarded: true, active: false }
+  ], messageHandler: async () => { throw Error("No receiver"); } });
+  await flush();
+  assert.deepEqual(r.calls.reload, [1]);
+  await r.tick();
+  assert.deepEqual(r.calls.reload, [1]);
+});
+
+test("one unresponsive tab cannot block another channel or future checks", async () => {
+  const r = backgroundRuntime({ status: "OPEN", shortTimeout: true, tabs: [
+    { id: 1, url: liveUrl("first"), status: "complete", active: false },
+    { id: 2, url: liveUrl("second"), status: "complete", active: false }
+  ], messageHandler: (id, message) => id === 1 ? new Promise(() => {}) :
+    message.type === "live-page-state" ? { channelId: "second", ended: true } : undefined });
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  await flush();
+  assert.deepEqual(r.calls.reload, [2]);
+  const fetches = r.calls.fetch.length;
+  await r.tick();
+  await new Promise((resolve) => setTimeout(resolve, 40));
+  await flush();
+  assert.ok(r.calls.fetch.length > fetches);
+});
+
+
+test("closing one channel does not stop checking another playing channel", async () => {
+  const r = backgroundRuntime({ status: "OPEN", tabs: [
+    { id: 1, url: liveUrl("first"), status: "complete", active: false },
+    { id: 2, url: liveUrl("second"), status: "complete", active: false }
+  ] });
+  await flush();
+  r.setFetch(async (url) => ({ ok: true, status: 200, async json() {
+    return { code: 200, content:
+      { status: url.includes("/first/") ? "CLOSE" : "OPEN", liveId: 100 } };
+  } }));
+  await r.tick();
+  assert.equal(r.api.storage.session.data["live-watch:1"].status, "CLOSE");
+  assert.equal(r.api.storage.session.data["live-watch:2"].status, "OPEN");
+  assert.deepEqual(r.calls.reload, []);
+  assert.ok(r.calls.messages.some(([id, message]) => id === 2 && message.type === "automation-tick"));
+});
+
+test("removes old diagnostics without polling balances or collecting new records", async () => {
+  const r = backgroundRuntime({ status: "OPEN", local: {
+    liveDiagnostics: { entries: [{ type: "sample" }] }, autoClaimPower: true
+  } });
+  await flush();
+  await r.tick();
+  assert.equal(r.api.storage.local.data.liveDiagnostics, undefined);
+  assert.equal(r.api.storage.local.data.autoClaimPower, true);
+  assert.ok(!r.calls.fetch.some(([url]) => url.includes("/log-power")));
+  assert.ok(r.calls.messages.some(([, message]) => message.type === "automation-tick"));
+});
+
+test("old diagnostic cleanup failure cannot prevent playback recovery", async () => {
+  const r = backgroundRuntime();
+  await flush();
+  r.api.storage.local.remove = async () => { throw Error("quota"); };
+  await r.api.runtime.onStartup.emit()[0];
+  r.setStatus("OPEN", 101);
+  await r.tick();
+  assert.deepEqual(r.calls.reload, [1]);
+  const state = await r.message("resume-state");
+  await r.message("resume-started", state.token);
+  assert.equal(r.tabMap.get(1).mutedInfo.muted, false);
 });
 
 test("retains waiting state across background shutdown and groups identical channel requests", async () => {
@@ -280,6 +350,7 @@ function contentRuntime({ resume = { channelId: "streamer", token: "101:0" }, pl
   };
   const location = { pathname: "/live/streamer" };
   let videos = [video];
+  const window = { addEventListener(name, fn) { listeners.set(name, fn); }, postMessage() {} };
   vm.runInNewContext(content, {
     chrome: api, location, Date, console,
     setInterval(fn) { const id = Symbol(); intervals.set(id, fn); return id; },
@@ -287,10 +358,11 @@ function contentRuntime({ resume = { channelId: "streamer", token: "101:0" }, pl
     MutationObserver: class { constructor(fn) { this.fn = fn; observers.push(this); } observe() {} disconnect() { this.stopped = true; } },
     getComputedStyle: (node) => ({ visibility: node.visibility || "visible" }),
     document: { visibilityState: "visible", querySelectorAll(selector) { return selector === "video" ? videos : players; }, addEventListener(name, fn) { listeners.set(name, fn); } },
-    window: { addEventListener(name, fn) { listeners.set(name, fn); }, postMessage() {} }
+    window
   });
-  return { api, location, video, messages, intervals, observers, listeners, setVideos(next) { videos = next; } };
+  return { api, location, video, messages, intervals, observers, listeners, window, setVideos(next) { videos = next; } };
 }
+
 
 test("reports only visible player end notices, not pauses or hidden notices", async () => {
   const notice = (textContent, visible = true) => ({ textContent, getClientRects: () => visible ? [{}] : [], closest: () => null });

@@ -188,9 +188,74 @@
     liveAnchorAt: 0,
     lastObservedEnd: null,
     displayDuration: 0,
+    pausedPosition: null,
+    resumeTimer: null,
+
+    clearPausedPosition() {
+      clearTimeout(this.resumeTimer);
+      this.resumeTimer = null;
+      this.pausedPosition = null;
+    },
+
+    rememberPausedPosition(video) {
+      const range = seekableWindow(video);
+      if (
+        !settings.timelineAssist || !isLiveRoute() ||
+        !playbackState.manualTimelinePosition || !video?.paused ||
+        video.ended || !range || range.duration > 300
+      ) {
+        this.clearPausedPosition();
+        return;
+      }
+      const edge = this.liveEdge(video, range);
+      this.clearPausedPosition();
+      this.pausedPosition = {
+        video,
+        route: location.pathname,
+        source: video.currentSrc || video.src || "",
+        behind: Math.max(0, edge - video.currentTime)
+      };
+    },
+
+    onPause(event) {
+      if (event.target === mainVideo()) {
+        timelineAssist.rememberPausedPosition(event.target);
+      }
+    },
+
+    onPlay(event) {
+      const saved = timelineAssist.pausedPosition;
+      if (!saved || event.target !== saved.video) {
+        return;
+      }
+      clearTimeout(timelineAssist.resumeTimer);
+      // 기본 플레이어의 재생 이벤트가 위치를 바꾼 뒤 한 번만 보정한다.
+      timelineAssist.resumeTimer = setTimeout(() => {
+        if (timelineAssist.pausedPosition !== saved) {
+          return;
+        }
+        timelineAssist.clearPausedPosition();
+        const video = mainVideo();
+        if (
+          !settings.timelineAssist || !playbackState.manualTimelinePosition ||
+          video !== saved.video || location.pathname !== saved.route ||
+          (video.currentSrc || video.src || "") !== saved.source ||
+          video.paused || video.ended
+        ) {
+          return;
+        }
+        const range = seekableWindow(video);
+        if (!range || range.duration > 300) {
+          return;
+        }
+        const target = timelineAssist.liveEdge(video, range) - saved.behind;
+        timelineAssist.commitSeek(video, target, range);
+      }, 0);
+    },
 
     resetTimeline(video, range) {
       this.cancelDrag();
+      this.clearPausedPosition();
       this.timelineVideo = video;
       this.timelineRoute = location.pathname;
       this.liveAnchorEnd = range.end;
@@ -228,6 +293,7 @@
       this.element?.remove();
       this.element = null;
       this.cancelDrag();
+      this.clearPausedPosition();
     },
 
     cancelDrag() {
@@ -294,7 +360,11 @@
 
       const element = this.mount(player);
       const liveEdge = this.liveEdge(video, range);
-      const behind = Math.max(0, liveEdge - video.currentTime);
+      const saved = this.pausedPosition;
+      const behind = video.paused && saved?.video === video &&
+          saved.route === location.pathname
+        ? saved.behind
+        : Math.max(0, liveEdge - video.currentTime);
       const playerSaysLive = player.classList?.contains("pzp-pc--onlive");
       const atLiveEdge = core.isAtLiveEdge(
         playbackState.manualTimelinePosition,
@@ -330,6 +400,7 @@
     },
 
     commitSeek(video, target, range) {
+      this.clearPausedPosition();
       const safeEnd = Math.max(range.start, range.end - 0.25);
       const nextTime = core.clamp(target, range.start, safeEnd);
       const returningToLive =
@@ -345,6 +416,9 @@
         playbackState.markManualSeekIntent(true);
       }
       video.currentTime = nextTime;
+      if (video.paused) {
+        this.rememberPausedPosition(video);
+      }
       return true;
     },
 
@@ -509,6 +583,8 @@
     },
 
     start() {
+      document.addEventListener("pause", this.onPause, true);
+      document.addEventListener("play", this.onPlay, true);
       document.addEventListener("click", this.onClick, true);
       document.addEventListener("pointerdown", this.onPointerDown, true);
       document.addEventListener("pointermove", this.onPointerMove, true);
@@ -591,6 +667,7 @@
     },
 
     clearManualSeekIntent() {
+      timelineAssist.clearPausedPosition();
       this.manualTimelinePosition = false;
       this.manualTimelineRoute = "";
       this.userSeekIntentUntil = 0;
