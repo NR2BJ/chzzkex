@@ -47,6 +47,7 @@
     compressAudio: true,
     compressorPreset: "medium",
     timelineAssist: true,
+    timeMachine: true,
     watchTimer: true,
     followingAutoRefresh: true,
     sidebarPreview: true,

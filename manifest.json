@@ -3,7 +3,7 @@
   "name": "CHZZK EX",
   "short_name": "CHZZK EX",
   "description": "Playback, navigation, and chat conveniences for CHZZK.",
-  "version": "1.0.21",
+  "version": "1.0.22",
   "permissions": [
     "declarativeNetRequest",
     "storage",
@@ -47,6 +47,7 @@
         "src/features.css"
       ],
       "js": [
+        "src/hls.min.js",
         "src/settings.js",
         "src/rewrite-core.js",
         "src/injected.js",

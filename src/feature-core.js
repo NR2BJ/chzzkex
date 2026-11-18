@@ -20,6 +20,8 @@
     "CBOTBLIND"
   ]);
   const VISIBLE_CHAT_STATUSES = new Set(["NORMAL", "CANCEL"]);
+  const TIME_MACHINE_MAX_SECONDS = 3600;
+  const TIME_MACHINE_MAX_SEGMENTS = 1200;
 
   function clamp(value, minimum, maximum) {
     return Math.min(maximum, Math.max(minimum, value));
@@ -658,8 +660,406 @@
     return null;
   }
 
+  function resolveMediaUrl(uri, baseUrl) {
+    if (typeof uri !== "string" || !uri.trim()) {
+      return "";
+    }
+    try {
+      return new URL(uri.trim(), baseUrl).href;
+    } catch {
+      return "";
+    }
+  }
+
+  function parseMasterPlaylist(text, baseUrl) {
+    if (typeof text !== "string" || !text.includes("#EXTM3U")) {
+      return [];
+    }
+
+    const variants = [];
+    let pending = null;
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) {
+        continue;
+      }
+      if (line.startsWith("#EXT-X-STREAM-INF:")) {
+        const attributes = line.slice("#EXT-X-STREAM-INF:".length);
+        const resolution = /(?:^|,)RESOLUTION=(\d+)x(\d+)/.exec(attributes);
+        const bandwidth = /(?:^|,)BANDWIDTH=(\d+)/.exec(attributes);
+        pending = {
+          width: resolution ? Number(resolution[1]) : 0,
+          height: resolution ? Number(resolution[2]) : 0,
+          bandwidth: bandwidth ? Number(bandwidth[1]) : 0
+        };
+        continue;
+      }
+      if (line.startsWith("#") || !pending) {
+        continue;
+      }
+      const uri = resolveMediaUrl(line, baseUrl);
+      if (uri) {
+        variants.push({ ...pending, uri });
+      }
+      pending = null;
+    }
+    return variants;
+  }
+
+  function selectMasterVariant(variants, preferredHeight = 720) {
+    const list = (Array.isArray(variants) ? variants : []).filter(
+      (variant) => variant?.uri
+    );
+    if (!list.length) {
+      return null;
+    }
+
+    const target = Number(preferredHeight) || 720;
+    const exact = list.find((variant) => variant.height === target);
+    if (exact) {
+      return exact;
+    }
+    const below = list
+      .filter((variant) => variant.height > 0 && variant.height <= target)
+      .sort((a, b) => b.height - a.height)[0];
+    if (below) {
+      return below;
+    }
+    const above = list
+      .filter((variant) => variant.height > 0)
+      .sort((a, b) => a.height - b.height)[0];
+    return above || list[0];
+  }
+
+  function attributeValue(line) {
+    const index = line.indexOf(":");
+    return index >= 0 ? line.slice(index + 1).trim() : "";
+  }
+
+  function parseMediaPlaylist(text, baseUrl) {
+    if (typeof text !== "string" || !text.includes("#EXTM3U")) {
+      return null;
+    }
+
+    const segments = [];
+    let targetDuration = 0;
+    let mediaSequence = 0;
+    let mapUri = "";
+    let pendingDuration = null;
+    let pendingDateMs = null;
+    let nextDateMs = null;
+    let sequence = null;
+    let sawSegment = false;
+
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line) {
+        continue;
+      }
+      if (line.startsWith("#EXT-X-TARGETDURATION:")) {
+        targetDuration = Number(attributeValue(line)) || 0;
+        continue;
+      }
+      if (line.startsWith("#EXT-X-MEDIA-SEQUENCE:")) {
+        mediaSequence = Number(attributeValue(line)) || 0;
+        continue;
+      }
+      if (line.startsWith("#EXT-X-MAP:")) {
+        const match = /URI="([^"]+)"/.exec(line);
+        if (match) {
+          mapUri = resolveMediaUrl(match[1], baseUrl);
+        }
+        continue;
+      }
+      if (line.startsWith("#EXT-X-PROGRAM-DATE-TIME:")) {
+        const parsed = Date.parse(attributeValue(line));
+        if (Number.isFinite(parsed)) {
+          pendingDateMs = parsed;
+        }
+        continue;
+      }
+      if (line.startsWith("#EXTINF:")) {
+        const value = Number(attributeValue(line).split(",")[0]);
+        pendingDuration = Number.isFinite(value) && value > 0 ? value : 0;
+        continue;
+      }
+      if (line.startsWith("#") || pendingDuration === null) {
+        continue;
+      }
+
+      const uri = resolveMediaUrl(line, baseUrl);
+      if (!uri) {
+        continue;
+      }
+      if (sequence === null) {
+        sequence = mediaSequence;
+      }
+      const startMs = Number.isFinite(pendingDateMs)
+        ? pendingDateMs
+        : Number.isFinite(nextDateMs)
+          ? nextDateMs
+          : null;
+      const duration = pendingDuration;
+      segments.push({
+        sequence,
+        uri,
+        duration,
+        startMs,
+        endMs: Number.isFinite(startMs) ? startMs + duration * 1000 : null,
+        mapUri
+      });
+      if (Number.isFinite(startMs)) {
+        nextDateMs = startMs + duration * 1000;
+      }
+      sequence += 1;
+      pendingDuration = null;
+      pendingDateMs = null;
+      sawSegment = true;
+    }
+
+    if (!sawSegment) {
+      return null;
+    }
+    return { targetDuration, mediaSequence, mapUri, segments };
+  }
+
+  function mergeTimeMachineSegments(existing, parsed, options = {}) {
+    const maxAgeMs = Number.isFinite(options.maxAgeMs)
+      ? options.maxAgeMs
+      : TIME_MACHINE_MAX_SECONDS * 1000;
+    const incoming = Array.isArray(parsed) ? parsed : parsed?.segments;
+    const byUri = new Map();
+
+    for (const segment of Array.isArray(existing) ? existing : []) {
+      if (segment?.uri) {
+        byUri.set(segment.uri, segment);
+      }
+    }
+    for (const segment of Array.isArray(incoming) ? incoming : []) {
+      if (segment?.uri) {
+        byUri.set(segment.uri, segment);
+      }
+    }
+
+    const byStart = new Map();
+    for (const segment of byUri.values()) byStart.set(segment.startMs, segment);
+    const list = Array.from(byStart.values())
+      .filter(
+        (segment) =>
+          Number.isFinite(segment.startMs) &&
+          Number.isFinite(segment.endMs) &&
+          segment.endMs > segment.startMs
+      )
+      .sort((a, b) => a.startMs - b.startMs);
+    if (!list.length) {
+      return [];
+    }
+
+    const edgeMs = Math.max(...list.map((segment) => segment.endMs));
+    const cutoff = edgeMs - Math.max(0, maxAgeMs);
+    return list
+      .filter((segment) => segment.endMs >= cutoff)
+      .slice(-TIME_MACHINE_MAX_SEGMENTS);
+  }
+
+  function timeMachineAvailability(segments) {
+    const list = (Array.isArray(segments) ? segments : [])
+      .filter(
+        (segment) =>
+          Number.isFinite(segment.startMs) &&
+          Number.isFinite(segment.endMs) &&
+          segment.endMs > segment.startMs
+      )
+      .sort((a, b) => a.startMs - b.startMs);
+    if (!list.length) {
+      return { availableSeconds: 0, edgeMs: 0, oldestMs: 0 };
+    }
+
+    const edgeMs = list[list.length - 1].endMs;
+    const oldestMs = list[0].startMs;
+    return {
+      availableSeconds: Math.max(0, (edgeMs - oldestMs) / 1000),
+      edgeMs,
+      oldestMs
+    };
+  }
+
+  function selectTimeMachineWindow(segments, behindSeconds, windowSeconds = 300) {
+    const list = (Array.isArray(segments) ? segments : [])
+      .filter(
+        (segment) =>
+          Number.isFinite(segment.startMs) &&
+          Number.isFinite(segment.endMs) &&
+          segment.endMs > segment.startMs
+      )
+      .sort((a, b) => a.startMs - b.startMs);
+    if (!list.length) {
+      return null;
+    }
+
+    const availability = timeMachineAvailability(list);
+    const behind = Math.min(
+      Math.max(0, Number(behindSeconds) || 0),
+      availability.availableSeconds
+    );
+    const targetMs = availability.edgeMs - behind * 1000;
+    let index = list.findIndex(
+      (segment) => targetMs >= segment.startMs && targetMs < segment.endMs
+    );
+    if (index < 0) {
+      index = list.findIndex((segment) => segment.startMs >= targetMs);
+    }
+    if (index < 0) {
+      index = list.length - 1;
+    }
+
+    const selected = [];
+    let duration = 0;
+    for (let cursor = index; cursor < list.length; cursor += 1) {
+      if (cursor > index) {
+        const previous = list[cursor - 1];
+        if (Math.abs(list[cursor].startMs - previous.endMs) > 1500) {
+          break;
+        }
+        if (
+          previous.mapUri &&
+          list[cursor].mapUri &&
+          previous.mapUri !== list[cursor].mapUri
+        ) {
+          break;
+        }
+      }
+      selected.push(list[cursor]);
+      duration += list[cursor].duration;
+      if (duration >= windowSeconds) {
+        break;
+      }
+    }
+    if (!selected.length) {
+      return null;
+    }
+
+    return {
+      segments: selected,
+      startMs: selected[0].startMs,
+      endMs: selected[selected.length - 1].endMs,
+      duration,
+      targetMs,
+      behindSeconds: behind,
+      edgeMs: availability.edgeMs
+    };
+  }
+
+  function selectTimeMachineRange(segments, behindSeconds) {
+    const list = (Array.isArray(segments) ? segments : [])
+      .filter(
+        (segment) =>
+          Number.isFinite(segment.startMs) &&
+          Number.isFinite(segment.endMs) &&
+          segment.endMs > segment.startMs
+      )
+      .sort((a, b) => a.startMs - b.startMs);
+    if (!list.length) {
+      return null;
+    }
+
+    const availability = timeMachineAvailability(list);
+    const behind = Math.min(
+      Math.max(0, Number(behindSeconds) || 0),
+      availability.availableSeconds
+    );
+    const targetMs = availability.edgeMs - behind * 1000;
+    let index = list.findIndex(
+      (segment) => targetMs >= segment.startMs && targetMs < segment.endMs
+    );
+    if (index < 0 && targetMs === availability.edgeMs) index = list.length - 1;
+    if (index < 0) return null;
+
+    const contiguous = (previous, current) =>
+      Math.abs(current.startMs - previous.endMs) <= 1500 &&
+      (!previous.mapUri ||
+        !current.mapUri ||
+        previous.mapUri === current.mapUri);
+
+    let start = index;
+    while (start > 0 && contiguous(list[start - 1], list[start])) {
+      start -= 1;
+    }
+    let end = index;
+    while (end < list.length - 1 && contiguous(list[end], list[end + 1])) {
+      end += 1;
+    }
+
+    const selected = list.slice(start, end + 1);
+    let duration = 0;
+    const offsets = selected.map((segment) => {
+      const start = duration;
+      duration += segment.duration;
+      return start;
+    });
+    return {
+      segments: selected,
+      startMs: selected[0].startMs,
+      endMs: selected[selected.length - 1].endMs,
+      duration,
+      targetMs,
+      behindSeconds: behind,
+      edgeMs: availability.edgeMs,
+      offsets,
+      targetIndex: index - start
+    };
+  }
+
+  // 재생 목록은 조각 길이의 합, 재생바는 방송 시각을 기준으로 삼는다.
+  function replayElapsed(range, timeMs) {
+    const index = range.segments.findIndex(s => timeMs >= s.startMs && timeMs < s.endMs);
+    if (index < 0) return timeMs === range.endMs ? range.duration : null;
+    return range.offsets[index] + (timeMs - range.segments[index].startMs) / 1000;
+  }
+
+  function replayTime(range, elapsed) {
+    const value = clamp(elapsed, 0, range.duration);
+    let lo = 0;
+    let hi = range.offsets.length;
+    while (lo + 1 < hi) {
+      const mid = (lo + hi) >>> 1;
+      if (range.offsets[mid] <= value) lo = mid;
+      else hi = mid;
+    }
+    return range.segments[lo].startMs + (value - range.offsets[lo]) * 1000;
+  }
+
+  function buildTimeMachinePlaylist(window, mapUri) {
+    if (!window?.segments?.length) {
+      return "";
+    }
+
+    const maxDuration = Math.max(
+      ...window.segments.map((segment) => Number(segment.duration) || 0),
+      1
+    );
+    const lines = [
+      "#EXTM3U",
+      "#EXT-X-VERSION:7",
+      `#EXT-X-TARGETDURATION:${Math.max(1, Math.ceil(maxDuration))}`,
+      "#EXT-X-MEDIA-SEQUENCE:0",
+      "#EXT-X-PLAYLIST-TYPE:VOD",
+      "#EXT-X-INDEPENDENT-SEGMENTS"
+    ];
+    if (mapUri) {
+      lines.push(`#EXT-X-MAP:URI="${mapUri}"`);
+    }
+    for (const segment of window.segments) {
+      lines.push(`#EXTINF:${(Number(segment.duration) || 0).toFixed(6)},`);
+      lines.push(segment.uri);
+    }
+    lines.push("#EXT-X-ENDLIST");
+    return lines.join("\n");
+  }
+
   return Object.freeze({
     adaptiveLoudnessStats,
+    buildTimeMachinePlaylist,
     appendTimedSample,
     biquadQDbFromLinear,
     clamp,
@@ -686,6 +1086,15 @@
     loudnessDbFromEnergy,
     maximumAbsoluteTail,
     meanSquareTail,
+    mergeTimeMachineSegments,
+    parseMasterPlaylist,
+    parseMediaPlaylist,
+    selectMasterVariant,
+    replayElapsed,
+    replayTime,
+    selectTimeMachineRange,
+    selectTimeMachineWindow,
+    timeMachineAvailability,
     timelineSeekTarget,
     normalizationSafetyCeilingDb,
     percentile,

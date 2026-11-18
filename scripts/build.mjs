@@ -19,6 +19,7 @@ const stageDir = path.join(distDir, ".stage");
 const runtimeEntries = ["NOTICE.md", "popup", "rules", "src"];
 const contentBundleSources = ["src/content.js", "src/live-resume.js"];
 const mainBundleSources = [
+  "src/hls.min.js",
   "src/settings.js",
   "src/rewrite-core.js",
   "src/injected.js",

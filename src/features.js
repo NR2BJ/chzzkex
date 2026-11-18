@@ -31,7 +31,8 @@
     `[data-role='ima${EVENT_TITLE_TOKEN}ContainerEl']`,
     `[data-role='gv${EVENT_TITLE_TOKEN}ContainerEl']`,
     `#mid${EVENT_TITLE_TOKEN}VideoContainer`,
-    `#mid${EVENT_TITLE_TOKEN}PlayerWrapper`
+    `#mid${EVENT_TITLE_TOKEN}PlayerWrapper`,
+    ".cng-tm-overlay"
   ].join(", ");
   const NATIVE_TIMELINE_SELECTOR = [
     ".pzp-pc-progress-slider[role='slider']",
@@ -176,20 +177,50 @@
       : null;
   }
 
+  const speakerPath = "M11 4.702a.705.705 0 0 0-1.203-.498L6.413 7.587A1.4 1.4 0 0 1 5.416 8H3a1 1 0 0 0-1 1v6a1 1 0 0 0 1 1h2.416a1.4 1.4 0 0 1 .997.413l3.383 3.384A.705.705 0 0 0 11 19.298z";
+  const replayButtons = {
+    play: ["재생", "M6 3 20 12 6 21Z"],
+    pause: ["일시정지", "M15 4h2q1 0 1 1v14q0 1-1 1h-2q-1 0-1-1V5q0-1 1-1ZM7 4h2q1 0 1 1v14q0 1-1 1H7q-1 0-1-1V5q0-1 1-1Z"],
+    mute: ["음소거", speakerPath + " M16 9a5 5 0 0 1 0 6 M19.364 18.364a9 9 0 0 0 0-12.728"],
+    unmute: ["음소거 해제", speakerPath + " M22 9l-6 6 M16 9l6 6"]
+  };
+
+  function setReplayButton(button, action) {
+    const [label, path] = replayButtons[action];
+    if (button.title === label) return;
+    button.title = label;
+    button.setAttribute("aria-label", label);
+    if (!button.firstElementChild) {
+      const ns = "http://www.w3.org/2000/svg";
+      const icon = document.createElementNS(ns, "svg");
+      icon.setAttribute("viewBox", "0 0 24 24");
+      icon.setAttribute("aria-hidden", "true");
+      icon.append(document.createElementNS(ns, "path"));
+      button.append(icon);
+    }
+    button.firstElementChild.firstElementChild.setAttribute("d", path);
+  }
+
   const timelineAssist = {
     activePointerId: null,
     slider: null,
     dragVideo: null,
     dragRoute: "",
+    dragDuration: 0,
+    dragBehind: null,
     element: null,
     timelineVideo: null,
     timelineRoute: "",
     liveAnchorEnd: null,
     liveAnchorAt: 0,
     lastObservedEnd: null,
-    displayDuration: 0,
     pausedPosition: null,
     resumeTimer: null,
+    seekCheck: null,
+
+    enabled() {
+      return settings.timelineAssist || timeMachine.choosing || timeMachine.overlayActive();
+    },
 
     clearPausedPosition() {
       clearTimeout(this.resumeTimer);
@@ -207,13 +238,12 @@
         this.clearPausedPosition();
         return;
       }
-      const edge = this.liveEdge(video, range);
       this.clearPausedPosition();
       this.pausedPosition = {
         video,
         route: location.pathname,
         source: video.currentSrc || video.src || "",
-        behind: Math.max(0, edge - video.currentTime)
+        behind: Math.max(0, range.end - video.currentTime)
       };
     },
 
@@ -248,20 +278,19 @@
         if (!range || range.duration > 300) {
           return;
         }
-        const target = timelineAssist.liveEdge(video, range) - saved.behind;
+        const target = range.end - saved.behind;
         timelineAssist.commitSeek(video, target, range);
       }, 0);
     },
 
     resetTimeline(video, range) {
-      this.cancelDrag();
+      if (!this.isCurrentDrag()) this.cancelDrag();
       this.clearPausedPosition();
       this.timelineVideo = video;
       this.timelineRoute = location.pathname;
       this.liveAnchorEnd = range.end;
       this.liveAnchorAt = performance.now();
       this.lastObservedEnd = range.end;
-      this.displayDuration = range.duration;
       if (!playbackState.hasSeekIntentForRoute(location.pathname)) {
         playbackState.clearManualSeekIntent();
       }
@@ -277,19 +306,19 @@
       }
 
       const now = performance.now();
-      if (!playbackState.manualTimelinePosition) {
+      if (!playbackState.manualTimelinePosition || range.end !== this.lastObservedEnd) {
         this.liveAnchorEnd = range.end;
         this.liveAnchorAt = now;
-        this.displayDuration = range.duration;
       }
       this.lastObservedEnd = range.end;
       return core.projectLiveEdge(
         this.liveAnchorEnd,
-        (now - this.liveAnchorAt) / 1000
+        Math.min(2, (now - this.liveAnchorAt) / 1000)
       );
     },
 
     remove() {
+      clearTimeout(this.seekCheck);
       this.element?.remove();
       this.element = null;
       this.cancelDrag();
@@ -300,10 +329,54 @@
       this.slider
         ?.closest?.(".cng-timeline-assist")
         ?.classList?.remove("is-dragging");
+      if (this.slider?.hasPointerCapture?.(this.activePointerId)) {
+        this.slider.releasePointerCapture(this.activePointerId);
+      }
       this.activePointerId = null;
       this.slider = null;
       this.dragVideo = null;
       this.dragRoute = "";
+      this.dragDuration = 0;
+      this.dragBehind = null;
+      this.hidePreview();
+    },
+
+    duration(range) {
+      return Math.max(range?.duration || 0, timeMachine.availableBehind());
+    },
+
+    pointerBehind(event, track) {
+      const bounds = track.getBoundingClientRect();
+      const duration = this.dragDuration || this.duration(seekableWindow(mainVideo()));
+      if (!(bounds.width > 0 && duration > 0)) return null;
+      const ratio = core.clamp((event.clientX - bounds.left) / bounds.width, 0, 1);
+      return duration * (1 - ratio);
+    },
+
+    preview(event, track) {
+      const element = this.element;
+      if (!element) return;
+      const elementBounds = element.getBoundingClientRect();
+      const behind = this.pointerBehind(event, track);
+      if (behind === null) return;
+      const preview = element.querySelector(".cng-timeline-assist__preview");
+      if (!preview) {
+        return;
+      }
+      preview.textContent = core.formatOffset(
+        Math.round(behind)
+      );
+      preview.style.left = `${event.clientX - elementBounds.left}px`;
+      preview.hidden = false;
+    },
+
+    hidePreview() {
+      const preview = this.element?.querySelector?.(
+        ".cng-timeline-assist__preview"
+      );
+      if (preview) {
+        preview.hidden = true;
+      }
     },
 
     mount(player) {
@@ -330,21 +403,35 @@
       live.setAttribute("type", "button");
       live.setAttribute("title", "실시간으로 이동");
       live.textContent = "실시간";
-      track.append(fill, handle);
-      element.append(position, live, track);
+      const max = document.createElement("span");
+      max.className = "cng-timeline-assist__max";
+      max.setAttribute("aria-hidden", "true");
+      const native = document.createElement("span");
+      native.className = "cng-timeline-assist__native";
+      native.setAttribute("aria-hidden", "true");
+      const preview = document.createElement("span");
+      preview.className = "cng-timeline-assist__preview";
+      preview.setAttribute("aria-hidden", "true");
+      preview.hidden = true;
+      track.append(native, fill, handle);
+      element.append(position, live, max, preview, track);
+      track.addEventListener("pointermove", (event) => this.preview(event, track));
+      track.addEventListener("pointerleave", () => { if (!this.slider) this.hidePreview(); });
       player.appendChild(element);
       this.element = element;
       return element;
     },
 
     tick() {
-      if (!settings.timelineAssist || !isLiveRoute()) {
+      if (!this.enabled() || !isLiveRoute()) {
         this.remove();
         return;
       }
       const video = mainVideo();
+
+      const replay = timeMachine.overlayTimeline();
       const range = seekableWindow(video);
-      if (!video || !range || range.duration > 300) {
+      if (!video || (!replay && range?.duration > 300) || (!range && !replay && !timeMachine.choosing && !this.isCurrentDrag())) {
         this.remove();
         return;
       }
@@ -359,22 +446,44 @@
       }
 
       const element = this.mount(player);
-      const liveEdge = this.liveEdge(video, range);
+      if (replay) element.classList.add("is-time-machine");
+      else element.classList.remove("is-time-machine");
+      if (timeMachine.choosing) element.classList.add("is-choosing");
+      else element.classList.remove("is-choosing");
+      const liveEdge = range ? this.liveEdge(video, range) : 0;
+      const fullDuration = this.dragDuration || this.duration(range);
+      const gaps = timeMachine.gaps(fullDuration, range?.duration || 0);
+      element.style.setProperty("--cng-timeline-gaps", gaps);
+      const hasTimeMachine = fullDuration > (range?.duration || 0) + 1;
+      if (hasTimeMachine) {
+        element.classList.add("has-time-machine");
+      } else {
+        element.classList.remove("has-time-machine");
+      }
+      element.style.setProperty(
+        "--cng-timeline-native-start",
+        `${Math.max(
+          0,
+          Math.min(100, (1 - (range?.duration || 0) / fullDuration) * 100)
+        )}%`
+      );
+
       const saved = this.pausedPosition;
-      const behind = video.paused && saved?.video === video &&
-          saved.route === location.pathname
-        ? saved.behind
-        : Math.max(0, liveEdge - video.currentTime);
+      const nativeBehind = video.paused && saved?.video === video && saved.route === location.pathname
+        ? saved.behind : Math.max(0, liveEdge - video.currentTime);
+      const behind = this.dragBehind ?? replay?.behind ?? nativeBehind;
       const playerSaysLive = player.classList?.contains("pzp-pc--onlive");
-      const atLiveEdge = core.isAtLiveEdge(
+      const atLiveEdge = !replay && this.dragBehind === null && core.isAtLiveEdge(
         playbackState.manualTimelinePosition,
         playerSaysLive,
         behind
       );
       const ratio = atLiveEdge
         ? 1
-        : core.timelineProgress(behind, this.displayDuration);
-      const displayBehind = atLiveEdge ? 0 : behind;
+        : core.timelineProgress(behind, fullDuration);
+      const displayBehind = atLiveEdge
+        ? 0
+        : Math.min(behind, fullDuration);
       const displaySeconds = Math.max(0, Math.round(displayBehind));
       element.style.setProperty("--cng-timeline-progress", `${ratio * 100}%`);
       const position = element.querySelector(".cng-timeline-assist__position");
@@ -382,13 +491,22 @@
       if (position.textContent !== positionText) {
         position.textContent = positionText;
       }
+      const maxLabel = element.querySelector(".cng-timeline-assist__max");
+      if (maxLabel) {
+        maxLabel.textContent = hasTimeMachine
+          ? `최대 ${core.formatOffset(Math.round(fullDuration))}`
+          : "";
+      }
       if (atLiveEdge) {
         element.classList.add("is-live");
       } else {
         element.classList.remove("is-live");
       }
       const track = element.querySelector(".cng-timeline-assist__track");
-      track.setAttribute("aria-valuemin", String(-Math.round(this.displayDuration)));
+      track.setAttribute(
+        "aria-valuemin",
+        String(-Math.round(fullDuration))
+      );
       track.setAttribute("aria-valuemax", "0");
       track.setAttribute("aria-valuenow", String(-displaySeconds));
       track.setAttribute(
@@ -397,9 +515,16 @@
           ? "실시간"
           : `실시간 ${displaySeconds}초 전`
       );
+      track.setAttribute(
+        "aria-label",
+        hasTimeMachine
+          ? "라이브 타임라인, 왼쪽으로 드래그하면 과거 재생"
+          : "라이브 타임라인"
+      );
     },
 
     commitSeek(video, target, range) {
+      clearTimeout(this.seekCheck);
       this.clearPausedPosition();
       const safeEnd = Math.max(range.start, range.end - 0.25);
       const nextTime = core.clamp(target, range.start, safeEnd);
@@ -424,89 +549,98 @@
 
     goLive(video, range) {
       this.cancelDrag();
+      timeMachine.setChoosing(false);
+      if (timeMachine.overlayActive()) {
+        timeMachine.closeOverlay();
+      }
       return this.commitSeek(video, range.end - 0.25, range);
     },
 
     isCurrentDrag() {
       return Boolean(
         this.slider?.isConnected &&
-        this.dragVideo &&
-        this.dragVideo === mainVideo() &&
-        this.dragRoute === location.pathname
+        this.dragRoute === location.pathname &&
+        this.dragVideo === mainVideo()
       );
     },
 
-    seek(event, slider) {
+    seekBehind(behind) {
+      clearTimeout(this.seekCheck);
       const video = mainVideo();
       const range = seekableWindow(video);
-      if (!video || !range || range.duration > 300) {
-        return false;
+      if (range && range.duration <= 300 && behind <= range.duration) {
+        timeMachine.setChoosing(false);
+        const wasReplay = timeMachine.overlayActive();
+        const paused = wasReplay && timeMachine.overlayVideo.paused &&
+          !timeMachine.overlayVideo.ended && timeMachine.overlayVideo.readyState >= 2;
+        if (wasReplay) {
+          timeMachine.closeOverlay();
+          if (paused) video.pause();
+        }
+        this.liveAnchorEnd = range.end;
+        this.liveAnchorAt = performance.now();
+        this.commitSeek(video, range.end - behind, range);
+        if (wasReplay && !paused && video.paused) video.play().catch(() => {});
+        if (behind >= 10) this.verifyNativeRewind(video, behind);
+        return true;
       }
+      return timeMachine.openOrSeek(behind);
+    },
 
-      const bounds = slider.getBoundingClientRect();
-      if (bounds.width <= 0) {
-        return false;
-      }
-
-      const ratio = (event.clientX - bounds.left) / bounds.width;
-      const target = core.timelineSeekTarget(
-        range.start,
-        range.end,
-        timelineAssist.liveEdge(video, range),
-        timelineAssist.displayDuration,
-        ratio
-      );
-      if (target === null) {
-        return false;
-      }
-
-      return this.commitSeek(video, target, range);
+    verifyNativeRewind(video, behind) {
+      const route = location.pathname;
+      const source = video.currentSrc || video.src;
+      const began = performance.now();
+      const targetMs = (timeMachine.segments.at(-1)?.endMs ?? NaN) - behind * 1000;
+      this.seekCheck = setTimeout(() => {
+        if (location.pathname !== route || mainVideo() !== video || source !== (video.currentSrc || video.src) ||
+            !playbackState.manualTimelinePosition || !this.enabled() || this.slider || timeMachine.overlayActive() ||
+            video.seeking || video.ended || performance.now() - began > 5000) return;
+        const range = seekableWindow(video);
+        if (!range || range.end - video.currentTime > 5) return;
+        // 기본 플레이어가 실시간으로 되돌린 경우에만, 같은 시각의 보존 영상으로 전환한다.
+        const edge = timeMachine.segments.at(-1)?.endMs;
+        if (Number.isFinite(targetMs) && timeMachine.availableBehind() &&
+            timeMachine.segments.some(s => s.startMs <= targetMs && targetMs < s.endMs) &&
+            timeMachine.openOrSeek((edge - targetMs) / 1000)) return;
+        timeMachine.flash("기본 플레이어가 실시간으로 돌아갔습니다. 이 시점의 보존 영상이 없습니다.");
+      }, 1500);
     },
 
     onKeyDown(event) {
       const slider = event.target?.closest?.(
         ".cng-timeline-assist__track[role='slider']"
       );
-      if (!settings.timelineAssist || !slider) {
+      if (!slider || !timelineAssist.enabled()) {
         return;
       }
       const video = mainVideo();
       const range = seekableWindow(video);
-      if (!video || !range) {
-        return;
+      const replay = timeMachine.overlayTimeline();
+      if (!range && !replay) return;
+      const behind = replay?.behind ?? Math.max(0, timelineAssist.liveEdge(video, range) - video.currentTime);
+      const duration = timelineAssist.duration(range);
+      let next;
+      switch (event.key) {
+        case "ArrowLeft": case "PageDown": next = behind + 5; break;
+        case "ArrowRight": case "PageUp": next = behind - 5; break;
+        case "Home": next = duration; break;
+        case "End": next = 0; break;
+        default: return;
       }
-
-      timelineAssist.liveEdge(video, range);
-
-      let target = null;
-      if (event.key === "ArrowLeft" || event.key === "PageDown") {
-        target = video.currentTime - 5;
-      } else if (event.key === "ArrowRight" || event.key === "PageUp") {
-        target = video.currentTime + 5;
-      } else if (event.key === "Home") {
-        target = range.start;
-      } else if (event.key === "End") {
-        timelineAssist.goLive(video, range);
-        event.preventDefault();
-        event.stopImmediatePropagation();
-        return;
-      }
-      if (target === null) {
-        return;
-      }
-
-      timelineAssist.commitSeek(video, target, range);
+      timelineAssist.cancelDrag();
+      timelineAssist.seekBehind(core.clamp(next, 0, duration));
       event.preventDefault();
       event.stopImmediatePropagation();
     },
 
     onPointerDown(event) {
-      if (!settings.timelineAssist || event.button !== 0) {
+      if (event.button !== 0 || !timelineAssist.enabled()) {
         return;
       }
 
       const slider = customTimelineSlider(event.target);
-      if (!slider || !timelineAssist.seek(event, slider)) {
+      if (!slider || timelineAssist.activePointerId !== null || timelineAssist.pointerBehind(event, slider) === null) {
         return;
       }
 
@@ -514,6 +648,11 @@
       timelineAssist.slider = slider;
       timelineAssist.dragVideo = mainVideo();
       timelineAssist.dragRoute = location.pathname;
+      timelineAssist.dragDuration = timelineAssist.duration(seekableWindow(mainVideo()));
+      timelineAssist.dragBehind = timelineAssist.pointerBehind(event, slider);
+      slider.setPointerCapture?.(event.pointerId);
+      timelineAssist.preview(event, slider);
+      timelineAssist.tick();
       slider.closest(".cng-timeline-assist")?.classList.add("is-dragging");
       event.preventDefault();
       event.stopImmediatePropagation();
@@ -526,7 +665,7 @@
       ) {
         return;
       }
-      if (!settings.timelineAssist) {
+      if (!timelineAssist.enabled()) {
         timelineAssist.cancelDrag();
         return;
       }
@@ -534,8 +673,9 @@
         timelineAssist.cancelDrag();
         return;
       }
-
-      timelineAssist.seek(event, timelineAssist.slider);
+      timelineAssist.dragBehind = timelineAssist.pointerBehind(event, timelineAssist.slider);
+      timelineAssist.preview(event, timelineAssist.slider);
+      timelineAssist.tick();
       event.preventDefault();
       event.stopImmediatePropagation();
     },
@@ -550,10 +690,12 @@
         return;
       }
 
-      if (settings.timelineAssist && timelineAssist.slider) {
-        timelineAssist.seek(event, timelineAssist.slider);
-      }
+      const behind = timelineAssist.pointerBehind(event, timelineAssist.slider);
       timelineAssist.cancelDrag();
+      if (timelineAssist.enabled() && behind !== null) {
+        timelineAssist.seekBehind(behind);
+        timelineAssist.tick();
+      }
       event.preventDefault();
       event.stopImmediatePropagation();
     },
@@ -569,15 +711,25 @@
 
     onClick(event) {
       const live = event.target?.closest?.(".cng-timeline-assist__live");
-      if (!settings.timelineAssist || !live) {
+      if (!timelineAssist.enabled()) {
+        return;
+      }
+      if (!live) {
+        if (event.target?.closest?.(".cng-timeline-assist")) {
+          event.preventDefault();
+          event.stopImmediatePropagation();
+        }
         return;
       }
       const video = mainVideo();
       const range = seekableWindow(video);
       if (!video || !range || range.duration > 300) {
-        return;
+        if (timeMachine.overlayActive()) timeMachine.closeOverlay();
+        else if (timeMachine.choosing) timeMachine.setChoosing(false);
+        else return;
+      } else {
+        timelineAssist.goLive(video, range);
       }
-      timelineAssist.goLive(video, range);
       event.preventDefault();
       event.stopImmediatePropagation();
     },
@@ -590,6 +742,7 @@
       document.addEventListener("pointermove", this.onPointerMove, true);
       document.addEventListener("pointerup", this.onPointerUp, true);
       document.addEventListener("pointercancel", this.onPointerCancel, true);
+      document.addEventListener("lostpointercapture", this.onPointerCancel, true);
       document.addEventListener("keydown", this.onKeyDown, true);
       setInterval(() => this.tick(), 250);
     }
@@ -888,6 +1041,7 @@
     video: null,
     graph: null,
     graphs: new WeakMap(),
+    directSources: new WeakMap(),
     outputGain: null,
     compressor: null,
     compressorTrim: null,
@@ -1019,6 +1173,44 @@
       this.sampleBuffers = [];
       this.peakAnalysers = [];
       this.peakSampleBuffers = [];
+    },
+
+    releaseReplay(video) {
+      const graph = this.graphs.get(video);
+      if (!graph) return;
+      if (this.video === video) this.detachVideo();
+      // 보존 구간을 바꿀 때마다 만들어지는 영상은 다시 연결하지 않는다.
+      for (const node of [graph.source, ...graph.downstreamNodes]) {
+        try { node.disconnect(); } catch {}
+      }
+      this.graphs.delete(video);
+    },
+
+    parkLiveAudio(video) {
+      // 기본 영상은 계속 재생하되 소리만 끊어 원래 음량·재생 버튼을 유지한다.
+      try {
+        const url = new URL(video.currentSrc || video.src, location.href);
+        if (url.origin !== location.origin && !video.crossOrigin) return null;
+        if (this.ensureContext()?.state !== "running") return null;
+        const graph = this.graphs.get(video);
+        if (graph?.failed) return null;
+        this.unlocked = true;
+        if (graph) {
+          this.disconnectGraph(graph);
+          return () => this.connectGraph(graph);
+        }
+        // 효과를 쓰지 않는 영상은 복귀할 때도 가공 없이 바로 출력한다.
+        let source = this.directSources.get(video);
+        if (source) {
+          source.disconnect();
+        } else {
+          source = this.context.createMediaElementSource(video);
+          this.directSources.set(video, source);
+        }
+        return () => source.connect(this.context.destination);
+      } catch {
+        return null;
+      }
     },
 
     applyGain(gainDb, timeConstant = 1.5) {
@@ -1344,7 +1536,13 @@
       ];
       let source;
       try {
-        source = this.context.createMediaElementSource(video);
+        source = this.directSources.get(video);
+        if (source) {
+          source.disconnect();
+          this.directSources.delete(video);
+        } else {
+          source = this.context.createMediaElementSource(video);
+        }
       } catch (error) {
         for (const node of downstreamNodes) {
           try {
@@ -1356,6 +1554,7 @@
 
       const graph = {
         source,
+        downstreamNodes,
         outputGain,
         compressor,
         compressorTrim,
@@ -1376,16 +1575,11 @@
     },
 
     ensureGraph() {
-      if (!settings.normalizeVolume && !settings.compressAudio) {
-        this.applyGain(0, 0.2);
-        this.configureCompressor(false);
-        this.configureLimiter(false);
-        return;
-      }
-
-      const video = mainVideo();
+      const video = timeMachine.overlayVideo || mainVideo();
+      const enabled = settings.normalizeVolume || settings.compressAudio;
       const route = channelIdFromLocation();
-      if (!video) {
+      // 한 번 Web Audio에 연결한 영상은 기능을 꺼도 출력 경로가 필요하다.
+      if (!video || (!enabled && !this.graphs.has(video))) {
         return;
       }
       if (
@@ -1399,7 +1593,7 @@
       if (video === this.video) {
         this.configureCompressor();
         this.configureLimiter();
-        if (core.shouldResetLoudnessMeasurement(this.route, route)) {
+        if (settings.normalizeVolume && core.shouldResetLoudnessMeasurement(this.route, route)) {
           this.resetMeasurement(route);
         }
         return;
@@ -1431,11 +1625,13 @@
         this.peakSampleBuffers = graph.peakAnalysers.map(
           (analyser) => new Float32Array(analyser.fftSize)
         );
-        if (core.shouldResetLoudnessMeasurement(this.route, route)) {
+        if (settings.normalizeVolume && core.shouldResetLoudnessMeasurement(this.route, route)) {
           this.resetMeasurement(route);
-        } else {
-          this.applyGain(this.gainDb, 0.2);
         }
+        const gain = this.outputGain.gain;
+        const now = this.context.currentTime;
+        gain.cancelScheduledValues(now);
+        gain.setValueAtTime(settings.normalizeVolume ? 10 ** (this.gainDb / 20) : 1, now);
         log("loudness normalizer attached", {
           contextSampleRate: this.context.sampleRate,
           playbackRate: video.playbackRate,
@@ -1792,6 +1988,14 @@
     }
   };
 
+  function playbackStatusAnchor() {
+    const host = mainVideo()?.closest(".pzp-pc") || document;
+    return host.querySelector(".pzp-pc__bottom-buttons-left") ||
+      host.querySelector(".pzp-pc__bottom-buttons") ||
+      host.querySelector("[class*='pzp-pc__bottom-buttons']") ||
+      host.querySelector(".cng-tm-bar.is-fallback");
+  }
+
   const watchTimer = {
     element: null,
     elapsedMs: 0,
@@ -1809,17 +2013,12 @@
     },
 
     mount() {
-      if (this.element?.isConnected) {
-        return;
-      }
-
-      const anchor =
-        document.querySelector(".pzp-pc__bottom-buttons-left") ||
-        document.querySelector(".pzp-pc__bottom-buttons") ||
-        document.querySelector("[class*='pzp-pc__bottom-buttons']");
+      const anchor = playbackStatusAnchor();
       if (!anchor) {
         return;
       }
+      if (this.element?.isConnected && this.element.parentElement === anchor) return;
+      this.remove();
 
       const element = document.createElement("span");
       element.className = "cng-watch-timer";
@@ -1842,7 +2041,7 @@
         return;
       }
 
-      const video = mainVideo();
+      const video = timeMachine.overlayVideo || mainVideo();
       if (video && !video.paused && !video.ended && video.readyState >= 2) {
         this.elapsedMs += Math.min(65000, now - this.previousTick);
       }
@@ -2324,13 +2523,11 @@
 
     onVolumeChange(event) {
       const video = event.target;
-      if (!(video instanceof HTMLVideoElement) || video !== mainVideo()) {
-        return;
-      }
+      if (!(video instanceof HTMLVideoElement)) return;
       if (video === loudness.video) {
         loudness.configureCompressor();
       }
-      volumeTooltip.show(video);
+      if (video === mainVideo() && !timeMachine.overlayVideo) volumeTooltip.show(video);
     },
 
     start() {
@@ -2362,20 +2559,17 @@
 
       const video = mainVideo();
       const range = seekableWindow(video);
-      const anchor =
-        document.querySelector(".pzp-pc__bottom-buttons-left") ||
-        document.querySelector(".pzp-pc__bottom-buttons") ||
-        document.querySelector("[class*='pzp-pc__bottom-buttons']");
-      if (!video || !range || !anchor) {
+      const anchor = playbackStatusAnchor();
+      if (!video || (!range && !timeMachine.overlayVideo) || !anchor) {
         this.element?.remove();
         this.element = null;
         return;
       }
 
-      const liveDistance = Math.max(
+      const liveDistance = range ? Math.max(
         0,
         timelineAssist.liveEdge(video, range) - video.currentTime
-      );
+      ) : 0;
       const player = video.closest(".pzp-pc");
       const atLiveEdge = core.isAtLiveEdge(
         playbackState.manualTimelinePosition,
@@ -2386,7 +2580,7 @@
       const element = this.ensureElement(anchor);
       const status = [];
       const details = [];
-      if (atLiveEdge) {
+      if (atLiveEdge && !timeMachine.overlayVideo) {
         status.push(`지연 ${liveDistance.toFixed(1)}초`);
         details.push(`지연: 현재 화면에서 실시간 위치까지 ${liveDistance.toFixed(1)}초`);
       }
@@ -3307,6 +3501,1005 @@
     }
   };
 
+  const TIME_MACHINE_MAX_SECONDS = 60 * 60;
+  const TIME_MACHINE_POLL_MS = 2000;
+  const TIME_MACHINE_MIN_SECONDS = 15;
+  const TIME_MACHINE_CACHE_PREFIX = "__chzzk_ex_tm_v1__:";
+  const TIME_MACHINE_CACHE_SAVE_MS = 3000;
+  const TIME_MACHINE_HLS =
+    typeof window.Hls === "function" ? window.Hls : null;
+
+  function liveHlsConstructor() {
+    if (TIME_MACHINE_HLS) {
+      return TIME_MACHINE_HLS;
+    }
+    const player = window.__player;
+    const control = player?.getPreProcessorControl?.("hls");
+    const candidates = [];
+    if (control) {
+      candidates.push(control);
+      for (const name of Object.getOwnPropertyNames(control)) {
+        try {
+          candidates.push(control[name]);
+        } catch {
+          // Ignore throwing getters on the player control.
+        }
+      }
+    }
+
+    for (const candidate of candidates) {
+      if (!candidate) {
+        continue;
+      }
+      let instance = null;
+      try {
+        instance =
+          typeof candidate.getHlsInstance === "function"
+            ? candidate.getHlsInstance()
+            : candidate;
+      } catch {
+        instance = null;
+      }
+      if (
+        instance &&
+        typeof instance.attachMedia === "function" &&
+        instance.constructor
+      ) {
+        return instance.constructor;
+      }
+    }
+
+    return typeof window.Hls === "function" ? window.Hls : null;
+  }
+
+  const timeMachine = {
+    started: false,
+    channel: "",
+    liveId: "",
+    source: null,
+    masterUrl: "",
+    variantUrl: "",
+    initUri: "",
+    segments: [],
+    official: false,
+    drm: false,
+    pollTimer: 0,
+    pollBusy: false,
+    cacheTimer: 0,
+    resolving: false,
+    resolveAt: 0,
+    host: null,
+    ui: null,
+    choosing: false,
+    overlay: null,
+    overlayVideo: null,
+    overlayHls: null,
+    overlayUrl: "",
+    overlayWindow: null,
+    overlayBaseTime: 0,
+    overlayClockReady: false,
+    overlayInitialElapsed: null,
+    overlayFailed: false,
+    overlayStatus: null,
+    replayUi: null,
+    overlayKeyHandler: null,
+    liveState: null,
+
+    start() {
+      if (this.started) {
+        return;
+      }
+      this.started = true;
+      setInterval(() => this.tick(), 1000);
+      window.addEventListener("pagehide", () => this.persistCache());
+    },
+
+    availableBehind() {
+      if (!settings.timeMachine || this.channel !== channelIdFromLocation() || this.official || this.drm || !this.segments.length) {
+        return 0;
+      }
+      return (this.segments.at(-1).endMs - this.segments[0].startMs) / 1000;
+    },
+
+    gaps(duration, nativeDuration) {
+      if (!this.availableBehind() || !duration) return "none";
+      if (this.gapIndex !== this.segments) {
+        this.gapIndex = this.segments;
+        this.holes = [];
+        for (let i = 1; i < this.segments.length; i++) {
+          const from = this.segments[i - 1].endMs;
+          const to = this.segments[i].startMs;
+          if (to - from > 1500) this.holes.push([from, to]);
+        }
+      }
+      const edge = this.segments.at(-1).endMs;
+      const stops = [];
+      for (const [a, b] of this.holes) {
+        const from = Math.max(0, 1 - (edge - a) / (1000 * duration));
+        const to = Math.min(1 - nativeDuration / duration, 1 - (edge - b) / (1000 * duration));
+        if (to > from) stops.push(`transparent ${100 * from}%, #282828 ${100 * from}% ${100 * to}%, transparent ${100 * to}%`);
+      }
+      return stops.length ? `linear-gradient(to right, ${stops.join(", ")})` : "none";
+    },
+
+    overlayActive() {
+      return Boolean(this.overlay && this.overlayVideo);
+    },
+
+    overlayTimeline() {
+      const video = this.overlayVideo;
+      const range = this.overlayWindow;
+      if (!video || !range) {
+        return null;
+      }
+      const blockDuration = Math.max(0, Number(range.duration) || 0);
+      const elapsed = core.clamp(this.overlayInitialElapsed ??
+        ((Number(video.currentTime) || 0) - this.overlayBaseTime), 0, blockDuration);
+      const edgeMs = this.segments.at(-1)?.endMs ?? range.edgeMs;
+      const positionMs = core.replayTime(range, elapsed);
+      return { elapsed, positionMs, behind: Math.max(0, (edgeMs - positionMs) / 1000) };
+    },
+
+
+    applyOverlaySeek() {
+      const video = this.overlayVideo;
+      if (!video || video.readyState < 1 || !this.overlayClockReady || this.overlayInitialElapsed === null) return;
+      const target = this.overlayBaseTime + this.overlayInitialElapsed;
+      try {
+        if (Math.abs(video.currentTime - target) > 0.05) video.currentTime = target;
+        this.overlayInitialElapsed = null;
+      } catch {
+        // 메타데이터가 준비되면 다시 적용한다.
+      }
+    },
+
+    openOrSeek(behind) {
+      if (!this.availableBehind()) return false;
+      const targetMs = this.segments.at(-1).endMs - behind * 1000;
+      if (this.overlayActive()) {
+        const elapsed = core.replayElapsed(this.overlayWindow, targetMs);
+        if (elapsed !== null && !this.overlayFailed && elapsed < this.overlayWindow.duration) {
+          const ended = this.overlayVideo.ended;
+          this.overlayInitialElapsed = elapsed;
+          this.applyOverlaySeek();
+          if (ended) this.overlayVideo.play().catch(() => {});
+          if (this.overlayVideo.readyState >= 2) this.overlayStatus.textContent = "";
+          return true;
+        }
+      }
+      const video = this.overlayVideo;
+      return this.open(behind, video ? { reuseLiveState: true, playback: {
+        volume: video.volume, muted: video.muted, rate: video.playbackRate,
+        paused: video.paused && !video.ended && video.readyState >= 2 && !this.overlayFailed
+      } } : {});
+    },
+
+    finishBlock() {
+      const range = this.overlayWindow;
+      if (!range || this.overlayFailed) return;
+      const edge = this.segments.at(-1)?.endMs ?? range.edgeMs;
+      const behind = Math.max(0, (edge - range.endMs) / 1000);
+      const native = seekableWindow(mainVideo());
+      if (native && behind <= native.duration) {
+        timelineAssist.seekBehind(behind);
+        return;
+      }
+      const next = this.segments.find(s => Math.abs(s.startMs - range.endMs) < 100 && s.endMs > range.endMs);
+      if (!next || !this.openOrSeek((edge - next.startMs - 1) / 1000)) {
+        this.overlayStatus.textContent = "이어서 재생할 구간이 없습니다";
+      }
+    },
+
+    tick() {
+      if (!settings.timeMachine || !isLiveRoute()) {
+        this.stopCapture();
+        this.closeOverlay();
+        this.removeUi();
+        return;
+      }
+
+      const channel = channelIdFromLocation();
+      if (channel !== this.channel) {
+        this.resetChannel(channel);
+      }
+      this.ensureSource();
+      this.ensureCapture();
+      this.replayUi?.refresh();
+      this.updateUi();
+    },
+
+    resetChannel(channel) {
+      this.closeOverlay();
+      this.stopCapture();
+      this.removeUi();
+      this.channel = channel;
+      this.liveId = "";
+      this.source = null;
+      this.masterUrl = "";
+      this.variantUrl = "";
+      this.initUri = "";
+      this.segments = [];
+      this.official = false;
+      this.drm = false;
+      this.resolving = false;
+      this.resolveAt = 0;
+    },
+
+    stopCapture() {
+      if (this.pollTimer) {
+        clearInterval(this.pollTimer);
+        this.pollTimer = 0;
+      }
+      if (this.cacheTimer) {
+        clearTimeout(this.cacheTimer);
+        this.cacheTimer = 0;
+        this.persistCache();
+      }
+    },
+
+    cacheKey() {
+      return this.channel && this.liveId
+        ? `${TIME_MACHINE_CACHE_PREFIX}${this.channel}:${this.liveId}`
+        : "";
+    },
+
+    restoreCache() {
+      const key = this.cacheKey();
+      if (!key) {
+        return false;
+      }
+      try {
+        const raw = sessionStorage.getItem(key);
+        if (!raw) {
+          return false;
+        }
+        const saved = JSON.parse(raw);
+        const segments = Array.isArray(saved?.segments)
+          ? saved.segments
+          : [];
+        const merged = core.mergeTimeMachineSegments(segments, [], {
+          maxAgeMs: TIME_MACHINE_MAX_SECONDS * 1000
+        });
+        if (!merged.length) {
+          return false;
+        }
+        const initUri =
+          typeof saved.initUri === "string" ? saved.initUri : "";
+        this.segments = merged.map((segment) => ({
+          ...segment,
+          mapUri: segment.mapUri || initUri
+        }));
+        this.initUri = initUri;
+        return true;
+      } catch {
+        return false;
+      }
+    },
+
+    schedulePersist() {
+      if (this.cacheTimer) {
+        return;
+      }
+      this.cacheTimer = setTimeout(() => {
+        this.cacheTimer = 0;
+        this.persistCache();
+      }, TIME_MACHINE_CACHE_SAVE_MS);
+    },
+
+    persistCache() {
+      const key = this.cacheKey();
+      if (!key || !this.segments.length) {
+        return;
+      }
+      try {
+        const channelPrefix = `${TIME_MACHINE_CACHE_PREFIX}${this.channel}:`;
+        for (let index = sessionStorage.length - 1; index >= 0; index -= 1) {
+          const name = sessionStorage.key(index);
+          if (
+            name &&
+            name.startsWith(channelPrefix) &&
+            name !== key
+          ) {
+            sessionStorage.removeItem(name);
+          }
+        }
+        sessionStorage.setItem(
+          key,
+          JSON.stringify({
+            segments: this.segments.map(s => s.mapUri === this.initUri ? { ...s, mapUri: undefined } : s),
+            initUri: this.initUri,
+            savedAt: Date.now()
+          })
+        );
+      } catch {
+        // Storage can be unavailable or full; the live index still works in memory.
+      }
+    },
+
+    ensureSource() {
+      if (
+        !this.channel ||
+        this.source ||
+        this.resolving ||
+        performance.now() < this.resolveAt
+      ) {
+        return;
+      }
+      this.resolveSource();
+    },
+
+    async resolveSource() {
+      this.resolving = true;
+      try {
+        const response = await fetch(
+          `https://api.chzzk.naver.com/service/v1.1/channels/${this.channel}/live-playback-json-meta?tm=true`,
+          { credentials: "include", cache: "no-store" }
+        );
+        const payload = await response.json();
+        if (payload?.code !== 200) {
+          throw new Error(`playback code ${payload?.code}`);
+        }
+        let playback = payload.content?.playbackJson;
+        if (typeof playback === "string") {
+          playback = JSON.parse(playback);
+        }
+        if (!playback?.media?.length) {
+          throw new Error("playback media missing");
+        }
+        const isHls = (entry) =>
+          entry?.protocol === "HLS" ||
+          entry?.protocol === "LLHLS" ||
+          entry?.mediaId === "HLS" ||
+          entry?.mediaId === "LLHLS";
+        const media =
+          playback.media.find(
+            (entry) => isHls(entry) && entry?.latency !== "lowLatency"
+          ) || playback.media.find((entry) => isHls(entry));
+        if (!media?.path) {
+          throw new Error("hls path missing");
+        }
+
+        const liveId = String(playback.meta?.liveId ?? "");
+        if (this.liveId && liveId && liveId !== this.liveId) {
+          this.closeOverlay();
+          this.segments = [];
+          this.initUri = "";
+        }
+        this.liveId = liveId || this.liveId;
+        if (!this.segments.length) {
+          this.restoreCache();
+        }
+
+        this.source = playback;
+        this.masterUrl = media.path;
+        this.official = Boolean(
+          playback.live?.timeMachine ||
+            playback.meta?.livePreview ||
+            payload.content?.tmp
+        );
+        this.drm = Boolean(
+          playback.meta?.playbackAuthType &&
+            playback.meta.playbackAuthType !== "NONE"
+        );
+        this.variantUrl = "";
+        if (!this.official && !this.drm) {
+          await this.resolveVariant();
+        }
+      } catch (error) {
+        log("time machine source failed", error);
+        this.resolveAt = performance.now() + 10_000;
+      } finally {
+        this.resolving = false;
+      }
+    },
+
+    async resolveVariant() {
+      if (!this.masterUrl) {
+        return;
+      }
+      const response = await fetch(this.masterUrl, { cache: "no-store" });
+      if (!response.ok) {
+        throw new Error(`master ${response.status}`);
+      }
+      const text = await response.text();
+      const variants = core.parseMasterPlaylist(text, this.masterUrl);
+      const variant = core.selectMasterVariant(variants, 1080);
+      this.variantUrl = variant?.uri || this.masterUrl;
+
+      if (!variant) {
+        const parsed = core.parseMediaPlaylist(text, this.masterUrl);
+        if (parsed) {
+          this.applyPlaylist(parsed);
+          return;
+        }
+      }
+      await this.poll();
+    },
+
+    ensureCapture() {
+      if (
+        this.pollTimer ||
+        !this.variantUrl ||
+        this.official ||
+        this.drm
+      ) {
+        return;
+      }
+      this.pollTimer = setInterval(() => this.poll(), TIME_MACHINE_POLL_MS);
+      this.poll();
+    },
+
+    async poll() {
+      if (this.pollBusy || !this.variantUrl) {
+        return;
+      }
+      this.pollBusy = true;
+      try {
+        const response = await fetch(this.variantUrl, { cache: "no-store" });
+        if (!response.ok) {
+          throw new Error(`playlist ${response.status}`);
+        }
+        const text = await response.text();
+        const parsed = core.parseMediaPlaylist(text, this.variantUrl);
+        if (parsed) {
+          this.applyPlaylist(parsed);
+        }
+      } catch (error) {
+        log("time machine playlist failed", error);
+        this.stopCapture();
+        this.source = null;
+        this.masterUrl = "";
+        this.variantUrl = "";
+        this.resolveAt = performance.now() + 10_000;
+      } finally {
+        this.pollBusy = false;
+      }
+    },
+
+    applyPlaylist(parsed) {
+      const mapUri = parsed.mapUri || this.initUri;
+      const segments = parsed.segments.map((segment) => ({
+        ...segment,
+        mapUri: segment.mapUri || mapUri
+      }));
+      this.segments = core.mergeTimeMachineSegments(this.segments, segments, {
+        maxAgeMs: TIME_MACHINE_MAX_SECONDS * 1000
+      });
+      this.initUri = mapUri;
+      this.schedulePersist();
+    },
+
+    playerContainer() {
+      const video = mainVideo();
+      return (
+        video?.closest(".pzp-pc") ||
+        video?.closest("[class*='video_player']") ||
+        video?.parentElement ||
+        null
+      );
+    },
+
+    updateUi() {
+      if (
+        !settings.timeMachine ||
+        !isLiveRoute() ||
+        this.official ||
+        this.drm
+      ) {
+        this.stopCapture();
+        this.removeUi();
+        return;
+      }
+
+      if (settings.timelineAssist || this.overlayActive()) {
+        this.removeUi();
+        return;
+      }
+
+      const availability = core.timeMachineAvailability(this.segments);
+      if (availability.availableSeconds < TIME_MACHINE_MIN_SECONDS) {
+        this.removeUi();
+        return;
+      }
+      const player = this.playerContainer();
+      if (!player) {
+        this.removeUi();
+        return;
+      }
+      this.mountUi(player);
+    },
+
+    mountUi(player) {
+      if (this.ui?.isConnected && this.ui.parentElement === player) {
+        return;
+      }
+      this.removeUi();
+
+      const button = document.createElement("button");
+      button.type = "button";
+      button.className = "cng-tm-toggle";
+      button.textContent = "타임머신";
+      button.setAttribute("aria-expanded", "false");
+      button.title = "페이지를 연 뒤 받은 구간을 최대 1시간까지 되감기";
+      const stopPlayerEvent = (event) => event.stopPropagation();
+      button.addEventListener("pointerdown", stopPlayerEvent);
+      button.addEventListener("click", (event) => {
+        stopPlayerEvent(event);
+        this.setChoosing(!this.choosing);
+        timelineAssist.tick();
+        if (this.choosing) timelineAssist.element?.querySelector(".cng-timeline-assist__track")?.focus?.();
+      });
+
+      player.classList.add("cng-tm-host");
+      player.append(button);
+      this.host = player;
+      this.ui = button;
+    },
+
+    setChoosing(value) {
+      this.choosing = value;
+      this.ui?.setAttribute("aria-expanded", String(value));
+    },
+
+    removeUi() {
+      this.choosing = false;
+      if (this.ui) {
+        this.ui.remove();
+        this.ui = null;
+      }
+      if (this.host) {
+        this.host.classList.remove("cng-tm-host");
+        this.host = null;
+      }
+    },
+
+    open(behindSeconds, options = {}) {
+      const segmentRange = core.selectTimeMachineRange(
+        this.segments,
+        behindSeconds
+      );
+      if (!segmentRange) {
+        this.flash("되감을 구간이 없습니다");
+        return;
+      }
+      const HlsConstructor = liveHlsConstructor();
+      if (!HlsConstructor) {
+        this.flash("플레이어 라이브러리를 찾지 못했습니다");
+        return;
+      }
+      const video = mainVideo();
+      const player = this.playerContainer();
+      if (!video || !player) {
+        this.flash("플레이어를 찾지 못했습니다");
+        return;
+      }
+
+      const mapUri = segmentRange.segments[0]?.mapUri || this.initUri;
+      const playlist = core.buildTimeMachinePlaylist(segmentRange, mapUri);
+      if (!playlist) {
+        this.flash("재생 목록을 만들지 못했습니다");
+        return;
+      }
+      this.closeOverlay(!options.reuseLiveState);
+      this.overlayFailed = false;
+      const initialElapsed = core.replayElapsed(segmentRange, segmentRange.targetMs);
+
+      const leftSelector = ".pzp-pc__bottom-buttons-left";
+      const left = player.querySelector(leftSelector);
+      if (!this.liveState) {
+        this.liveState = {
+          video,
+          parked: left?.querySelector(".pzp-pc__playback-switch") && left.querySelector(".pzp-pc__volume-control")
+            ? loudness.parkLiveAudio(video) : null,
+          muted: video.muted,
+          volume: video.volume,
+          paused: video.paused
+        };
+        if (!this.liveState.parked) video.muted = true;
+      }
+      const nativeControls = Boolean(this.liveState.parked);
+
+      const overlay = document.createElement("div");
+      overlay.className = "cng-tm-overlay";
+      const overlayVideo = document.createElement("video");
+      overlayVideo.className = "cng-tm-video";
+      overlayVideo.disablePictureInPicture = true;
+      overlayVideo.setAttribute("playsinline", "");
+      overlayVideo.playsInline = true;
+      const playback = options.playback || null;
+      overlayVideo.volume = playback
+        ? playback.volume
+        : this.liveState.volume;
+      overlayVideo.muted = playback
+        ? playback.muted
+        : this.liveState.muted;
+      overlayVideo.playbackRate = playback ? playback.rate : 1;
+
+      const bar = document.createElement("div");
+      bar.className = "cng-tm-bar";
+      bar.setAttribute("role", "group");
+      bar.setAttribute("aria-label", "과거 재생 조작");
+      const playButton = document.createElement("button");
+      playButton.type = "button";
+      playButton.className = "cng-tm-play";
+      const speed = document.createElement("select");
+      speed.className = "cng-tm-speed";
+      speed.setAttribute("aria-label", "재생 속도");
+      for (const rate of [0.5, 0.75, 1, 1.25, 1.5, 2]) {
+        const option = document.createElement("option");
+        option.value = String(rate);
+        option.textContent = `${rate}×`;
+        speed.append(option);
+      }
+      speed.value = String(overlayVideo.playbackRate);
+      const volumeButton = document.createElement("button");
+      volumeButton.type = "button";
+      volumeButton.className = "cng-tm-volume";
+      const volumeRange = document.createElement("input");
+      volumeRange.type = "range";
+      volumeRange.className = "cng-tm-volume-range";
+      volumeRange.min = "0";
+      volumeRange.max = "1";
+      volumeRange.step = "0.01";
+      volumeRange.setAttribute("aria-label", "음량");
+      if (!nativeControls) bar.append(playButton, volumeButton, volumeRange);
+      bar.append(speed);
+
+      const status = document.createElement("div");
+      status.className = "cng-tm-status";
+      status.setAttribute("role", "status");
+      status.textContent = "불러오는 중…";
+      overlay.append(overlayVideo, status);
+      const mountSurface = () => {
+        if (overlay.parentElement === player) return;
+        let surface = video;
+        while (surface.parentElement && surface.parentElement !== player) surface = surface.parentElement;
+        const poster = player.querySelector(":scope > .pzp-pc__poster");
+        (poster || surface).after(overlay);
+      };
+      mountSurface();
+      player.setAttribute("data-cng-replay", nativeControls ? "native" : "local");
+      const placeControls = () => {
+        if (!video.isConnected || !player.isConnected || !player.contains(video)) {
+          this.closeOverlay();
+          return;
+        }
+        mountSurface();
+        const row = player.querySelector(leftSelector);
+        const ownTransport = !nativeControls || !row;
+        if (ownTransport && !bar.contains(playButton)) bar.prepend(playButton, volumeButton, volumeRange);
+        if (!ownTransport && bar.contains(playButton)) {
+          for (const control of [playButton, volumeButton, volumeRange]) control.remove();
+        }
+        const target = (!ownTransport && player.querySelector(".pzp-pc__bottom-buttons-right")) || row || player;
+        if (bar.parentElement !== target) {
+          target.prepend(bar);
+        }
+        bar.classList.toggle("is-fallback", !row);
+        const filter = getComputedStyle(video).filter;
+        if (overlayVideo.style.filter !== filter) overlayVideo.style.filter = filter;
+      };
+      placeControls();
+      bar.addEventListener("click", event => event.stopPropagation());
+      bar.addEventListener("pointerdown", event => event.stopPropagation());
+
+      const listeners = new AbortController();
+      let startupTimer;
+      const fail = message => {
+        if (this.overlayVideo !== overlayVideo || this.overlayFailed) return;
+        clearTimeout(startupTimer);
+        this.overlayFailed = true;
+        status.textContent = message;
+      };
+      const firstFrame = () => {
+        if (this.overlayVideo !== overlayVideo || this.overlayFailed || overlayVideo.readyState < 2 || !overlayVideo.videoWidth) return;
+        clearTimeout(startupTimer);
+        if (status.textContent !== "재생 버튼을 눌러 주세요" || !overlayVideo.paused) status.textContent = "";
+      };
+      for (const event of ["loadeddata", "canplay", "playing"]) overlayVideo.addEventListener(event, firstFrame);
+      overlayVideo.addEventListener("error", () => fail("과거 영상을 읽지 못했습니다. 다른 위치를 선택해 주세요."));
+      const playReplay = () => overlayVideo.play().catch(error => {
+        if (error.name === "AbortError" || this.overlayVideo !== overlayVideo) return;
+        if (error.name === "NotAllowedError") {
+          status.textContent = "재생 버튼을 눌러 주세요";
+        } else {
+          fail("과거 영상을 재생하지 못했습니다. 다른 위치를 선택해 주세요.");
+        }
+      });
+      const bind = (type, fn) => video.addEventListener(type, fn, {signal: listeners.signal});
+      if (nativeControls) {
+        const syncVolume = () => {
+          overlayVideo.muted = video.muted;
+          overlayVideo.volume = video.volume;
+        };
+        syncVolume();
+        bind("volumechange", syncVolume);
+        bind("play", playReplay);
+        bind("pause", () => overlayVideo.pause());
+      } else {
+        bind("volumechange", () => { if (!video.muted) video.muted = true; });
+        bind("play", playReplay);
+        bind("pause", () => overlayVideo.pause());
+      }
+      this.replayUi = {
+        refresh: placeControls,
+        remove() {
+          clearTimeout(startupTimer);
+          listeners.abort();
+          bar.remove();
+          player.removeAttribute("data-cng-replay");
+        }
+      };
+
+      this.overlay = overlay;
+      this.overlayVideo = overlayVideo;
+      loudness.ensureGraph();
+      this.overlayStatus = status;
+      this.overlayWindow = segmentRange;
+      this.overlayBaseTime = 0;
+      this.overlayClockReady = false;
+      this.overlayInitialElapsed = initialElapsed;
+      startupTimer = setTimeout(() => {
+        if (overlayVideo.readyState < 2 || !overlayVideo.videoWidth) {
+          if (!this.overlayFailed) status.textContent = "이 구간의 영상 응답이 늦습니다. 다른 위치나 실시간을 선택할 수 있습니다.";
+        }
+      }, 15000);
+      this.removeUi();
+      timelineAssist.tick();
+
+      const syncPlayUi = () => setReplayButton(playButton, overlayVideo.paused ? "play" : "pause");
+      const syncVolumeUi = () => {
+        const muted = overlayVideo.muted || overlayVideo.volume === 0;
+        setReplayButton(volumeButton, muted ? "unmute" : "mute");
+        volumeRange.value = String(
+          overlayVideo.muted ? 0 : overlayVideo.volume
+        );
+        const percent = Math.round(Number(volumeRange.value) * 100) + "%";
+        volumeRange.setAttribute("aria-valuetext", percent);
+        volumeRange.title = percent;
+      };
+      syncPlayUi();
+      syncVolumeUi();
+      playButton.addEventListener("click", () => {
+        const target = nativeControls ? video : overlayVideo;
+        if (target.paused) {
+          if (target === overlayVideo) playReplay();
+          else target.play().catch(() => {});
+        } else {
+          target.pause();
+        }
+      });
+      const toggleMute = () => {
+        const audio = nativeControls ? video : overlayVideo;
+        audio.muted = !(audio.muted || audio.volume === 0);
+        if (!audio.muted && audio.volume === 0) {
+          audio.volume = 0.5;
+        }
+        syncVolumeUi();
+      };
+      volumeButton.addEventListener("click", toggleMute);
+      volumeRange.addEventListener("input", () => {
+        const value = Number(volumeRange.value) || 0;
+        const audio = nativeControls ? video : overlayVideo;
+        audio.volume = value;
+        audio.muted = value === 0;
+        syncVolumeUi();
+      });
+      overlayVideo.addEventListener("volumechange", syncVolumeUi);
+      speed.addEventListener("change", () => {
+        overlayVideo.playbackRate = Number(speed.value) || 1;
+      });
+      this.overlayKeyHandler = (event) => {
+        if (event.key === "Escape" && !document.fullscreenElement &&
+            !player.querySelector(".pzp-pc-settings--open, [popover]:popover-open")) {
+          event.stopPropagation();
+          this.closeOverlay();
+          return;
+        }
+        if (event.defaultPrevented || event.target?.closest?.("input, button, select, .cng-tm-bar, .cng-timeline-assist")) {
+          return;
+        }
+        const currentVideo = this.overlayVideo;
+        const currentWindow = this.overlayWindow;
+        if (!currentVideo || !currentWindow) {
+          return;
+        }
+        const seekBy = (delta) => {
+          const behind = this.overlayTimeline().behind;
+          timelineAssist.seekBehind(core.clamp(behind - delta, 0, this.availableBehind()));
+        };
+        const handled = () => {
+          event.preventDefault();
+          event.stopPropagation();
+        };
+        switch (event.key) {
+          case " ":
+          case "Spacebar":
+          case "k":
+          case "K":
+          case "ㅏ":
+            handled();
+            if (nativeControls) {
+              if (video.paused) video.play().catch(() => {});
+              else video.pause();
+            } else if (currentVideo.paused) {
+              currentVideo.play().catch(() => {});
+            } else {
+              currentVideo.pause();
+            }
+            break;
+          case "ArrowLeft":
+          case "j":
+          case "J":
+          case "ㅓ":
+            handled();
+            seekBy(-5);
+            break;
+          case "ArrowRight":
+          case "l":
+          case "L":
+          case "ㅣ":
+            handled();
+            seekBy(5);
+            break;
+          case "m":
+          case "M":
+          case "ㅡ":
+            handled();
+            toggleMute();
+            break;
+          default:
+            if (/^[0-9]$/.test(event.key)) {
+              handled();
+            }
+            break;
+        }
+      };
+      document.addEventListener("keydown", this.overlayKeyHandler, true);
+      overlayVideo.addEventListener("loadedmetadata", () => {
+        if (this.overlayVideo !== overlayVideo) return;
+        this.applyOverlaySeek();
+      });
+      overlayVideo.addEventListener("play", syncPlayUi);
+      overlayVideo.addEventListener("pause", syncPlayUi);
+      overlayVideo.addEventListener("ended", () => {
+        if (this.overlayVideo !== overlayVideo) {
+          return;
+        }
+        this.finishBlock();
+      });
+
+      const blob = new Blob([playlist], {
+        type: "application/vnd.apple.mpegurl"
+      });
+      this.overlayUrl = URL.createObjectURL(blob);
+
+      let hls;
+      try {
+        hls = new HlsConstructor({
+          enableWorker: false,
+          lowLatencyMode: false,
+          startPosition: initialElapsed,
+          backBufferLength: 60,
+          maxBufferLength: 30,
+          maxMaxBufferLength: 60
+        });
+      } catch (error) {
+        log("time machine hls create failed", error);
+        this.overlayFailed = true;
+        status.textContent = "플레이어를 초기화하지 못했습니다";
+        return;
+      }
+      this.overlayHls = hls;
+      hls.on("hlsFragBuffered", (_, { frag }) => {
+        if (this.overlayVideo !== overlayVideo) return;
+        const offset = segmentRange.offsets[frag.sn];
+        if (Number.isFinite(offset) && Number.isFinite(frag.start)) {
+          this.overlayBaseTime = frag.start - offset;
+          this.overlayClockReady = true;
+          this.applyOverlaySeek();
+        }
+      });
+      hls.on("hlsError", (event, data) => {
+        if (this.overlayVideo !== overlayVideo || !data || this.overlayFailed) return;
+        const unavailable = [403, 404, 410].includes(data.response?.code);
+        const targetUnavailable = unavailable && overlayVideo.readyState < 2 &&
+          data.details === "fragLoadError" && (data.frag?.sn === segmentRange.targetIndex || data.frag?.sn === "initSegment");
+        if (!data.fatal && !targetUnavailable) return;
+        fail(unavailable
+          ? "방송 서버에서 이 구간을 제공하지 않습니다. 다른 위치를 선택해 주세요."
+          : "이 구간을 재생할 수 없습니다. 다른 위치를 선택해 주세요.");
+        if (targetUnavailable) hls.stopLoad();
+      });
+      hls.on("hlsManifestParsed", () => {
+        if (this.overlayVideo !== overlayVideo) return;
+        if (nativeControls ? video.paused : playback?.paused) {
+          this.overlayVideo?.pause();
+        } else {
+          playReplay();
+        }
+      });
+      try {
+        hls.loadSource(this.overlayUrl);
+        hls.attachMedia(overlayVideo);
+      } catch (error) {
+        log("time machine hls attach failed", error);
+        this.overlayFailed = true;
+        status.textContent = "이 구간을 재생하지 못했습니다";
+      }
+      return true;
+    },
+
+    closeOverlay(restoreLive = true) {
+      const closedVideo = this.overlayVideo;
+      this.overlayVideo = null;
+      this.replayUi?.remove();
+      this.replayUi = null;
+      if (closedVideo) loudness.releaseReplay(closedVideo);
+      if (this.overlayKeyHandler) {
+        document.removeEventListener("keydown", this.overlayKeyHandler, true);
+        this.overlayKeyHandler = null;
+      }
+      if (this.overlayHls) {
+        try {
+          this.overlayHls.destroy();
+        } catch {
+          // Ignore a player that already failed to initialize.
+        }
+        this.overlayHls = null;
+      }
+      if (this.overlayUrl) {
+        try {
+          URL.revokeObjectURL(this.overlayUrl);
+        } catch {
+          // Ignore a missing blob URL implementation.
+        }
+        this.overlayUrl = "";
+      }
+      if (this.overlay) {
+        this.overlay.remove();
+        this.overlay = null;
+      }
+      this.overlayWindow = null;
+      this.overlayBaseTime = 0;
+      this.overlayInitialElapsed = null;
+      this.overlayStatus = null;
+
+      const video = mainVideo();
+      if (restoreLive && this.liveState?.parked) {
+        this.liveState.parked();
+      } else if (restoreLive && video && this.liveState?.video === video) {
+        if (closedVideo) {
+          video.volume = closedVideo.volume;
+          video.muted = closedVideo.muted;
+        } else {
+          video.muted = this.liveState.muted;
+          video.volume = this.liveState.volume;
+        }
+        if (this.liveState.paused) {
+          video.pause();
+        }
+      }
+      if (restoreLive) {
+        this.liveState = null;
+        if (closedVideo) loudness.ensureGraph();
+        if (closedVideo && !settings.timelineAssist) timelineAssist.remove();
+      }
+    },
+
+    flash(message) {
+      const player = this.playerContainer();
+      if (!player) {
+        return;
+      }
+      const toast = document.createElement("div");
+      toast.className = "cng-tm-toast";
+      toast.textContent = message;
+      player.append(toast);
+      setTimeout(() => toast.remove(), 2600);
+    }
+  };
+
   function applySettings(nextSettings) {
     const previousMaximumBoostDb = loudness.currentMaximumBoostDb();
     const previousTargetLoudnessDb = loudness.currentTargetLoudnessDb();
@@ -3336,8 +4529,13 @@
     ) {
       loudness.refreshNormalizationPlan();
     }
-    if (!settings.timelineAssist) {
+    if (!timelineAssist.enabled()) {
       timelineAssist.remove();
+    }
+    if (!settings.timeMachine) {
+      timeMachine.closeOverlay();
+      timeMachine.stopCapture();
+      timeMachine.removeUi();
     }
     sidebarPreview.setEnabled(Boolean(settings.sidebarPreview));
     chatEnhancements.cleanupDisabledFeatures();
@@ -3366,6 +4564,7 @@
 
   function start() {
     timelineAssist.start();
+    timeMachine.start();
     playbackState.start();
     initialLiveEdgeSync.start();
     loudness.start();

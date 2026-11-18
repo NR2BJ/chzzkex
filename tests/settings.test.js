@@ -17,6 +17,7 @@ test("keeps one complete immutable settings definition", () => {
     "compressAudio",
     "compressorPreset",
     "timelineAssist",
+    "timeMachine",
     "watchTimer",
     "followingAutoRefresh",
     "sidebarPreview",

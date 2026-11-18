@@ -19,6 +19,7 @@ function createRuntime() {
     __CHZZK_EX_FEATURE_CORE__: core,
     __CHZZK_EX_CONFIG__: config,
     console,
+    URL,
     document: {
       documentElement: null,
       addEventListener() {},
@@ -27,6 +28,7 @@ function createRuntime() {
       }
     },
     location: {
+      origin: "https://chzzk.naver.com",
       href: "https://chzzk.naver.com/live/test-channel",
       pathname: "/live/test-channel"
     },
@@ -64,7 +66,7 @@ function createRuntime() {
   const instrumentedSource = featureSource.replace(
     "const loudness = {",
     "const loudness = globalThis.__CHZZK_EX_TEST_LOUDNESS__ = {"
-  ).replace(
+  ).replace("const timeMachine = {", "const timeMachine = globalThis.__replay = {").replace(
     "function applySettings(nextSettings) {",
     "const applySettings = globalThis.__CHZZK_EX_TEST_APPLY_SETTINGS__ = function applySettings(nextSettings) {"
   );
@@ -79,6 +81,10 @@ function createRuntime() {
 
   return {
     loudness: sandbox.__CHZZK_EX_TEST_LOUDNESS__,
+    replay: sandbox.__replay,
+    setMainVideo(video) {
+      sandbox.document.querySelectorAll = selector => selector === "video" ? [video] : [];
+    },
     setNow(value) {
       nowMs = value;
     },
@@ -135,7 +141,7 @@ class FakeAudioNode {
     return target;
   }
 
-  disconnect() {}
+  disconnect() { this.connections = []; }
 }
 
 function compressorNode(kind = "compressor") {
@@ -178,6 +184,7 @@ function createAudioContext({ failAtChannelSplitter = false } = {}) {
   const destination = new FakeAudioNode("destination");
 
   return {
+    state: "running",
     currentTime: 7,
     sampleRate: 44100,
     destination,
@@ -351,6 +358,30 @@ test("audio graph measures the volume-compensated compressor output", () => {
   assert.equal(graph.limiter.ratio.value, 20);
 });
 
+test("native replay controls do not process raw audio or create a second media source", () => {
+  const {loudness} = createRuntime();
+  const ctx = loudness.context = createAudioContext();
+  const video = {src: "/live.mp4", muted: false, volume: 0.4};
+  assert.equal(loudness.parkLiveAudio({src:"https://other.example/live.mp4"}), null);
+  ctx.state = "suspended";
+  assert.equal(loudness.parkLiveAudio(video), null);
+  assert.deepEqual(ctx.creationOrder, []);
+  ctx.state = "running";
+  const restore = loudness.parkLiveAudio(video);
+  const direct = loudness.directSources.get(video);
+  assert.deepEqual(ctx.creationOrder, ["media-source"]);
+  assert.equal(video.muted, false);
+  assert.equal(direct.connections.length, 0);
+  restore();
+  assert.equal(direct.connections[0].target, ctx.destination);
+  loudness.parkLiveAudio(video)();
+  const graph = loudness.createGraph(video);
+  assert.equal(graph.source, direct);
+  assert.equal(direct.connections.length, 1);
+  assert.equal(direct.connections[0].target, graph.compressor);
+  assert.equal(ctx.creationOrder.filter(kind => kind === "media-source").length, 1);
+});
+
 test("downstream graph failure cannot consume the media element source", () => {
   const { loudness } = createRuntime();
   const context = createAudioContext({ failAtChannelSplitter: true });
@@ -365,6 +396,50 @@ test("downstream graph failure cannot consume the media element source", () => {
     false,
     "createMediaElementSource must be the final, non-recoverable setup step"
   );
+});
+
+test("live and replay hand off the measured gain, compressor and single audio output", () => {
+  const runtime = createRuntime();
+  const { loudness, replay } = runtime;
+  const live = { volume: 0.5, isConnected: true, readyState: 4, closest: () => null };
+  const past = { volume: 0.25 };
+  runtime.setMainVideo(live);
+  loudness.context = createAudioContext();
+  loudness.unlocked = true;
+  runtime.updateSettings({ normalizeVolume: true, compressAudio: true, timeMachine: true });
+  const liveGraph = loudness.graph;
+  loudness.gainDb = -4;
+  loudness.activeBlockCount = 80;
+  replay.overlayVideo = past;
+  loudness.ensureGraph();
+  const graph = loudness.graph;
+  assert.equal(loudness.video, past);
+  assert.equal(loudness.activeBlockCount, 80);
+  assert.equal(graph.outputGain.gain.value, 10 ** (-4 / 20));
+  assert.equal(graph.compressor.ratio.value, 3);
+  assert.equal(graph.compressor.threshold.value, core.compressorThresholdForMediaVolume(-18, 0.25));
+  assert.equal(liveGraph.source.connections.length, 0);
+  loudness.ensureGraph();
+  assert.equal(graph.source.connections.length, 1);
+  runtime.updateSettings({ compressAudio: false });
+  assert.equal(graph.compressor.ratio.lastTarget(), 1);
+  runtime.updateSettings({ normalizeVolume: false, compressAudio: true });
+  assert.equal(graph.compressor.ratio.lastTarget(), 3);
+  assert.equal(graph.outputGain.gain.lastTarget(), 1);
+  runtime.updateSettings({ compressAudio: false });
+  replay.overlayVideo = null;
+  loudness.releaseReplay(past);
+  loudness.ensureGraph();
+  assert.equal(loudness.graph, liveGraph);
+  assert.equal(liveGraph.source.connections.length, 1);
+  assert.equal(liveGraph.compressor.ratio.lastTarget(), 1);
+  assert.equal(liveGraph.limiter.ratio.lastTarget(), 1);
+  assert.equal(liveGraph.outputGain.gain.value, 1);
+  assert.equal(loudness.graphs.has(past), false);
+  assert.ok([graph.source, ...graph.downstreamNodes].every(node => !node.connections.length));
+  replay.overlayVideo = { volume: 1 };
+  loudness.ensureGraph();
+  assert.equal(loudness.graphs.has(replay.overlayVideo), false);
 });
 
 test("normalization warm-up counts only blocks still in the active history window", () => {

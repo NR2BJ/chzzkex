@@ -170,6 +170,34 @@ function createRuntime({
           this.style.values.set(name, String(value));
         }
       };
+      this._eventListeners = new Map();
+    }
+
+    addEventListener(type, listener) {
+      const listeners = this._eventListeners.get(type) || [];
+      listeners.push(listener);
+      this._eventListeners.set(type, listeners);
+    }
+
+    removeEventListener(type, listener) {
+      const listeners = this._eventListeners.get(type) || [];
+      const index = listeners.indexOf(listener);
+      if (index >= 0) {
+        listeners.splice(index, 1);
+      }
+    }
+
+    dispatchEvent(event = {}) {
+      const payload = {
+        target: this,
+        stopPropagation() {},
+        preventDefault() {},
+        ...event
+      };
+      for (const listener of this._eventListeners.get(payload.type) || []) {
+        listener(payload);
+      }
+      return payload;
     }
 
     get className() {
@@ -811,6 +839,16 @@ function pausedRewindRuntime() {
   return { runtime, video, player, timeline, track, seekable };
 }
 
+test("seeks a minute behind the actual range after a stale native live edge", () => {
+  const {runtime, video, track} = pausedRewindRuntime();
+  runtime.setNow(90000);
+  runtime.runIntervals(250);
+  for (const type of ["pointerdown", "pointerup"]) {
+    runtime.dispatchDocumentEvent(type, {button: 0, clientX: 40, isTrusted: true, pointerId: 5, target: track});
+  }
+  assert.equal(video.currentTime, 40);
+});
+
 test("resumes at the saved live offset instead of the paused absolute time", () => {
   const { runtime, video, timeline, seekable } = pausedRewindRuntime();
   runtime.setNow(20000);
@@ -1195,7 +1233,7 @@ test("cancels a custom timeline drag when the route or video changes", () => {
     pointerId: 3,
     target: routeTrack
   });
-  assert.equal(routePlayer.video.currentTime, 25);
+  assert.equal(routePlayer.video.currentTime, 99.5);
   routeRuntime.setLocation("/live/channel-b");
   routeRuntime.dispatchDocumentEvent("pointermove", {
     clientX: 80,
@@ -1209,7 +1247,7 @@ test("cancels a custom timeline drag when the route or video changes", () => {
     pointerId: 3,
     target: routeTrack
   });
-  assert.equal(routePlayer.video.currentTime, 25);
+  assert.equal(routePlayer.video.currentTime, 99.5);
 
   const videoRuntime = createRuntime();
   const oldPlayer = videoRuntime.addPlayer({ currentTime: 99.5 });
@@ -1271,7 +1309,7 @@ test("a LIVE button or End cancels an active rewind drag", () => {
       pointerId: 5,
       target: track
     });
-    assert.equal(video.currentTime, 25);
+    assert.equal(video.currentTime, 99.5);
 
     if (action === "button") {
       runtime.dispatchDocumentEvent("click", {
@@ -2578,4 +2616,99 @@ test("keeps a normal blind restoration when the native hidden class changes", ()
     "moderator-hidden-message"
   );
   assert.equal(runtime.messageElement.classList.contains("cng-restored-message"), true);
+});
+
+function flushMicrotasks() {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
+test("indexes the live playlist and mounts the session time machine", async () => {
+  const masterUrl = "https://cdn.example/master.m3u8?token=1";
+  const variantUrl = "https://cdn.example/720p/chunklist.m3u8";
+  const mastLine = `#EXTM3U\n#EXT-X-STREAM-INF:BANDWIDTH=3192000,RESOLUTION=1280x720\n${variantUrl}`;
+  const startMs = Date.parse("2026-11-19T03:00:00.000Z");
+  const lines = [
+    "#EXTM3U",
+    "#EXT-X-VERSION:7",
+    "#EXT-X-TARGETDURATION:4",
+    "#EXT-X-MEDIA-SEQUENCE:100",
+    '#EXT-X-MAP:URI="720p_0_0_0.m4s?type=hls&filetype=.m4s"'
+  ];
+  for (let index = 0; index < 6; index += 1) {
+    lines.push(
+      `#EXT-X-PROGRAM-DATE-TIME:${new Date(startMs + index * 4000).toISOString()}`
+    );
+    lines.push("#EXTINF:4.000000,");
+    lines.push(`720p_seg${index}_1795_${index}_0_${100 + index}.m4v`);
+  }
+  const playlist = lines.join("\n");
+
+  const runtime = createRuntime({
+    fetch: async (url) => {
+      const target = String(url);
+      if (target.includes("live-playback-json-meta")) {
+        return {
+          ok: true,
+          async json() {
+            return {
+              code: 200,
+              content: {
+                playbackJson: JSON.stringify({
+                  meta: { playbackAuthType: "NONE" },
+                  live: { timeMachine: false },
+                  media: [{ protocol: "HLS", path: masterUrl }]
+                }),
+                tmp: false
+              }
+            };
+          },
+          async text() {
+            return "";
+          }
+        };
+      }
+      if (target === masterUrl) {
+        return {
+          ok: true,
+          async text() {
+            return mastLine;
+          },
+          async json() {
+            return {};
+          }
+        };
+      }
+      if (target === variantUrl) {
+        return {
+          ok: true,
+          async text() {
+            return playlist;
+          },
+          async json() {
+            return {};
+          }
+        };
+      }
+      throw new Error(`unexpected time machine URL ${target}`);
+    }
+  });
+  const { player } = runtime.addPlayer();
+  runtime.dispatchSettings({ timeMachine: true });
+
+  runtime.runIntervals(1000);
+  await flushMicrotasks();
+  runtime.runIntervals(1000);
+  await flushMicrotasks();
+
+  const button = player.querySelector(".cng-tm-toggle");
+  assert.ok(button, "time machine button must mount after the playlist is indexed");
+  button.dispatchEvent({ type: "click" });
+  assert.equal(button.getAttribute("aria-expanded"), "true");
+  assert.ok(player.querySelector(".cng-timeline-assist__track"));
+  button.dispatchEvent({ type: "click" });
+  assert.equal(button.getAttribute("aria-expanded"), "false");
+  assert.equal(player.querySelector(".cng-timeline-assist__track"), null);
+
+  runtime.dispatchSettings({ timeMachine: false });
+  assert.equal(player.querySelector(".cng-tm-toggle"), null);
 });

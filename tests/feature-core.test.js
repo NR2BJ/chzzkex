@@ -514,3 +514,155 @@ test("chat lookup prefers current React props and pending fiber props", () => {
     current
   );
 });
+
+const TIME_MACHINE_BASE =
+  "https://livecloud.example/chzzk/lip2_kr/stream/hdntl=exp=1795059252~acl=*~hmac=abc/720p/cppy_hls_chunklist.m3u8";
+const TIME_MACHINE_PLAYLIST = `#EXTM3U
+#EXT-X-VERSION:7
+#EXT-X-TARGETDURATION:10
+#EXT-X-MEDIA-SEQUENCE:1435
+#EXT-X-MAP:URI="720p_0_0_0.m4s?type=hls&filetype=.m4s"
+#EXT-X-PROGRAM-DATE-TIME:2026-11-18T10:33:32.712Z
+#EXTINF:4.000000,
+720p_a_1794998012712_5741_0_1435.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-11-18T10:33:36.712Z
+#EXTINF:4.000000,
+720p_b_1794998016712_5745_0_1436.m4v
+#EXT-X-PROGRAM-DATE-TIME:2026-11-18T10:33:40.712Z
+#EXTINF:4.000000,
+720p_c_1794998020712_5749_0_1437.m4v`;
+
+const TIME_MACHINE_MASTER = `#EXTM3U
+#EXT-X-STREAM-INF:BANDWIDTH=3192000,RESOLUTION=1280x720
+hdntl=exp=1~acl=*~hmac=x/720p/cppy_hls_chunklist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=8384000,RESOLUTION=1920x1080
+hdntl=exp=1~acl=*~hmac=y/1080p/cppy_hls_chunklist.m3u8
+#EXT-X-STREAM-INF:BANDWIDTH=696000,RESOLUTION=640x360
+hdntl=exp=1~acl=*~hmac=z/360p/cppy_hls_chunklist.m3u8`;
+
+test("parses a CHZZK media playlist with absolute segment URLs", () => {
+  const parsed = core.parseMediaPlaylist(TIME_MACHINE_PLAYLIST, TIME_MACHINE_BASE);
+  assert.ok(parsed);
+  assert.equal(parsed.targetDuration, 10);
+  assert.equal(parsed.mediaSequence, 1435);
+  assert.equal(parsed.mapUri, new URL("720p_0_0_0.m4s?type=hls&filetype=.m4s", TIME_MACHINE_BASE).href);
+  assert.equal(parsed.segments.length, 3);
+  assert.deepEqual(
+    parsed.segments.map((segment) => segment.sequence),
+    [1435, 1436, 1437]
+  );
+  assert.equal(parsed.segments[0].uri, new URL("720p_a_1794998012712_5741_0_1435.m4v", TIME_MACHINE_BASE).href);
+  assert.equal(
+    parsed.segments[0].startMs,
+    Date.parse("2026-11-18T10:33:32.712Z")
+  );
+  assert.equal(parsed.segments[0].endMs - parsed.segments[0].startMs, 4000);
+  assert.equal(parsed.segments[0].mapUri, parsed.mapUri);
+});
+
+test("selects the closest master variant", () => {
+  const variants = core.parseMasterPlaylist(TIME_MACHINE_MASTER, TIME_MACHINE_BASE);
+  assert.deepEqual(
+    variants.map((variant) => variant.height),
+    [720, 1080, 360]
+  );
+  assert.equal(core.selectMasterVariant(variants, 720).height, 720);
+  assert.equal(core.selectMasterVariant(variants, 1080).height, 1080);
+  assert.equal(core.selectMasterVariant(variants, 480).height, 360);
+  assert.equal(core.selectMasterVariant(variants, 0).height, 720);
+  assert.equal(core.selectMasterVariant([], 720), null);
+});
+
+test("merges overlapping time machine segments and drops old ones", () => {
+  const parsed = core.parseMediaPlaylist(TIME_MACHINE_PLAYLIST, TIME_MACHINE_BASE);
+  const merged = core.mergeTimeMachineSegments([], parsed);
+  assert.equal(merged.length, 3);
+
+  const overlap = core.parseMediaPlaylist(
+    TIME_MACHINE_PLAYLIST.replace(/#EXT-X-MEDIA-SEQUENCE:1435/, "#EXT-X-MEDIA-SEQUENCE:1436"),
+    TIME_MACHINE_BASE
+  );
+  const deduped = core.mergeTimeMachineSegments(merged, overlap);
+  assert.equal(deduped.length, 3);
+
+  const trimmed = core.mergeTimeMachineSegments(merged, [], { maxAgeMs: 5000 });
+  assert.equal(trimmed.length, 2);
+  assert.equal(trimmed[0].sequence, 1436);
+});
+
+test("spans cached blocks and stops replay windows at a gap", () => {
+  const parsed = core.parseMediaPlaylist(TIME_MACHINE_PLAYLIST, TIME_MACHINE_BASE);
+  const availability = core.timeMachineAvailability(parsed.segments);
+  assert.equal(availability.availableSeconds, 12);
+  assert.equal(availability.oldestMs, parsed.segments[0].startMs);
+
+  const separated = {
+    ...parsed.segments[2],
+    uri: "https://livecloud.example/late.m4v",
+    sequence: 1500,
+    startMs: parsed.segments[2].endMs + 60_000,
+    endMs: parsed.segments[2].endMs + 64_000
+  };
+  const cached = [...parsed.segments, separated];
+  const withGap = core.timeMachineAvailability(cached);
+  assert.equal(withGap.availableSeconds, 76);
+
+  const atEdge = core.selectTimeMachineWindow(cached, 0, 300);
+  assert.equal(atEdge.segments.length, 1);
+  assert.equal(atEdge.segments[0].sequence, 1500);
+
+  const beforeGap = core.selectTimeMachineWindow(cached, 70, 300);
+  assert.equal(beforeGap.segments.length, 2);
+  assert.equal(beforeGap.segments[0].sequence, 1436);
+});
+
+test("selects a bounded time machine window and builds a VOD playlist", () => {
+  const parsed = core.parseMediaPlaylist(TIME_MACHINE_PLAYLIST, TIME_MACHINE_BASE);
+  const window = core.selectTimeMachineWindow(parsed.segments, 8, 300);
+  assert.ok(window);
+  assert.equal(window.segments.length, 2);
+  assert.equal(window.segments[0].sequence, 1436);
+  assert.equal(window.duration, 8);
+  assert.equal(window.behindSeconds, 8);
+
+  const clamped = core.selectTimeMachineWindow(parsed.segments, 999, 300);
+  assert.equal(clamped.behindSeconds, 12);
+
+  const playlist = core.buildTimeMachinePlaylist(window, parsed.mapUri);
+  assert.match(playlist, /^#EXTM3U/);
+  assert.match(playlist, /#EXT-X-PLAYLIST-TYPE:VOD/);
+  assert.match(playlist, /#EXT-X-MAP:URI="https:\/\/livecloud\.example/);
+  assert.match(playlist, /#EXTINF:4\.000000,/);
+  assert.match(playlist, /#EXT-X-ENDLIST$/);
+  assert.equal((playlist.match(/#EXTINF:/g) || []).length, 2);
+});
+
+test("keeps the whole contiguous block in the time machine seek bar", () => {
+  const parsed = core.parseMediaPlaylist(TIME_MACHINE_PLAYLIST, TIME_MACHINE_BASE);
+  const range = core.selectTimeMachineRange(parsed.segments, 8);
+  assert.ok(range);
+  assert.equal(range.segments.length, 3);
+  assert.equal(range.duration, 12);
+  assert.equal(range.targetIndex, 1);
+  assert.equal(range.targetMs - range.startMs, 4000);
+  assert.equal(range.behindSeconds, 8);
+
+  const separated = {
+    ...parsed.segments[2],
+    uri: "https://livecloud.example/late.m4v",
+    sequence: 1500,
+    startMs: parsed.segments[2].endMs + 60_000,
+    endMs: parsed.segments[2].endMs + 64_000
+  };
+  const cached = [...parsed.segments, separated];
+  const oldBlock = core.selectTimeMachineRange(cached, 70);
+  assert.equal(core.selectTimeMachineRange(cached, 40), null);
+  assert.equal(core.replayElapsed(oldBlock, oldBlock.endMs + 1), null);
+  assert.equal(core.replayTime(oldBlock, core.replayElapsed(oldBlock, oldBlock.targetMs)), oldBlock.targetMs);
+  assert.equal(oldBlock.segments.length, 3);
+  assert.equal(oldBlock.segments[0].sequence, 1435);
+
+  const newBlock = core.selectTimeMachineRange(cached, 2);
+  assert.equal(newBlock.segments.length, 1);
+  assert.equal(newBlock.segments[0].sequence, 1500);
+});
