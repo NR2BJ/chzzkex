@@ -342,7 +342,7 @@
     },
 
     duration(range) {
-      return Math.max(range?.duration || 0, timeMachine.availableBehind());
+      return Math.max(range?.duration <= 300 ? range.duration : 0, timeMachine.availableBehind());
     },
 
     pointerBehind(event, track) {
@@ -3501,7 +3501,6 @@
     }
   };
 
-  const TIME_MACHINE_MAX_SECONDS = 60 * 60;
   const TIME_MACHINE_POLL_MS = 2000;
   const TIME_MACHINE_MIN_SECONDS = 15;
   const TIME_MACHINE_CACHE_PREFIX = "__chzzk_ex_tm_v1__:";
@@ -3554,6 +3553,9 @@
 
   const timeMachine = {
     started: false,
+    generation: 0,
+    limitSeconds: core.replayLimitSeconds(null),
+    checkLimitAt: 0,
     channel: "",
     liveId: "",
     source: null,
@@ -3598,7 +3600,7 @@
       if (!settings.timeMachine || this.channel !== channelIdFromLocation() || this.official || this.drm || !this.segments.length) {
         return 0;
       }
-      return (this.segments.at(-1).endMs - this.segments[0].startMs) / 1000;
+      return Math.min(this.limitSeconds, (this.segments.at(-1).endMs - this.segments[0].startMs) / 1000);
     },
 
     gaps(duration, nativeDuration) {
@@ -3654,13 +3656,16 @@
     },
 
     openOrSeek(behind) {
-      if (!this.availableBehind()) return false;
+      const available = this.availableBehind();
+      if (!available || !Number.isFinite(behind)) return false;
+      behind = core.clamp(behind, 0, available);
       const targetMs = this.segments.at(-1).endMs - behind * 1000;
       if (this.overlayActive()) {
         const elapsed = core.replayElapsed(this.overlayWindow, targetMs);
         if (elapsed !== null && !this.overlayFailed && elapsed < this.overlayWindow.duration) {
           const ended = this.overlayVideo.ended;
           this.overlayInitialElapsed = elapsed;
+          this.replayUi?.restartWait();
           this.applyOverlaySeek();
           if (ended) this.overlayVideo.play().catch(() => {});
           if (this.overlayVideo.readyState >= 2) this.overlayStatus.textContent = "";
@@ -3703,6 +3708,9 @@
         this.resetChannel(channel);
       }
       this.ensureSource();
+      if (this.source && !this.official && !this.drm && performance.now() >= this.checkLimitAt) {
+        void this.refreshLimit(this.channel, this.liveId, this.generation);
+      }
       this.ensureCapture();
       this.replayUi?.refresh();
       this.updateUi();
@@ -3713,6 +3721,10 @@
       this.stopCapture();
       this.removeUi();
       this.channel = channel;
+      this.generation++;
+      this.pollBusy = false;
+      this.limitSeconds = core.replayLimitSeconds(null);
+      this.checkLimitAt = 0;
       this.liveId = "";
       this.source = null;
       this.masterUrl = "";
@@ -3758,7 +3770,7 @@
           ? saved.segments
           : [];
         const merged = core.mergeTimeMachineSegments(segments, [], {
-          maxAgeMs: TIME_MACHINE_MAX_SECONDS * 1000
+          maxAgeMs: this.limitSeconds * 1000
         });
         if (!merged.length) {
           return false;
@@ -3828,7 +3840,28 @@
       this.resolveSource();
     },
 
+    async refreshLimit(channel, liveId, generation) {
+      this.checkLimitAt = performance.now() + 60_000;
+      try {
+        const info = await fetch(`https://api.chzzk.naver.com/service/v2/channels/${channel}/live-detail`, {
+          credentials: "include", cache: "no-store", signal: AbortSignal.timeout(4000)
+        });
+        const detail = info.ok && (await info.json()).content;
+        if (generation !== this.generation || detail?.channel?.channelId !== channel ||
+            (liveId && detail.liveId && String(detail.liveId) !== liveId)) return;
+        const limit = core.replayLimitSeconds(detail);
+        if (limit !== this.limitSeconds) {
+          timelineAssist.cancelDrag();
+          this.limitSeconds = limit;
+        }
+      } catch {
+        // 일시적인 조회 실패로 사용 중인 재생바 눈금을 바꾸지 않는다.
+      }
+    },
+
     async resolveSource() {
+      const generation = this.generation;
+      const channel = this.channel;
       this.resolving = true;
       try {
         const response = await fetch(
@@ -3836,6 +3869,7 @@
           { credentials: "include", cache: "no-store" }
         );
         const payload = await response.json();
+        if (generation !== this.generation) return;
         if (payload?.code !== 200) {
           throw new Error(`playback code ${payload?.code}`);
         }
@@ -3860,6 +3894,12 @@
         }
 
         const liveId = String(playback.meta?.liveId ?? "");
+        const official = Boolean(playback.live?.timeMachine || playback.meta?.livePreview || payload.content?.tmp);
+        const drm = Boolean(playback.meta?.playbackAuthType && playback.meta.playbackAuthType !== "NONE");
+        if (!official && !drm) {
+          await this.refreshLimit(channel, liveId, generation);
+        }
+        if (generation !== this.generation) return;
         if (this.liveId && liveId && liveId !== this.liveId) {
           this.closeOverlay();
           this.segments = [];
@@ -3872,28 +3912,23 @@
 
         this.source = playback;
         this.masterUrl = media.path;
-        this.official = Boolean(
-          playback.live?.timeMachine ||
-            playback.meta?.livePreview ||
-            payload.content?.tmp
-        );
-        this.drm = Boolean(
-          playback.meta?.playbackAuthType &&
-            playback.meta.playbackAuthType !== "NONE"
-        );
+        this.official = official;
+        this.drm = drm;
         this.variantUrl = "";
         if (!this.official && !this.drm) {
           await this.resolveVariant();
         }
       } catch (error) {
+        if (generation !== this.generation) return;
         log("time machine source failed", error);
         this.resolveAt = performance.now() + 10_000;
       } finally {
-        this.resolving = false;
+        if (generation === this.generation) this.resolving = false;
       }
     },
 
     async resolveVariant() {
+      const generation = this.generation;
       if (!this.masterUrl) {
         return;
       }
@@ -3902,6 +3937,7 @@
         throw new Error(`master ${response.status}`);
       }
       const text = await response.text();
+      if (generation !== this.generation) return;
       const variants = core.parseMasterPlaylist(text, this.masterUrl);
       const variant = core.selectMasterVariant(variants, 1080);
       this.variantUrl = variant?.uri || this.masterUrl;
@@ -3930,6 +3966,7 @@
     },
 
     async poll() {
+      const generation = this.generation;
       if (this.pollBusy || !this.variantUrl) {
         return;
       }
@@ -3940,11 +3977,13 @@
           throw new Error(`playlist ${response.status}`);
         }
         const text = await response.text();
+        if (generation !== this.generation) return;
         const parsed = core.parseMediaPlaylist(text, this.variantUrl);
         if (parsed) {
           this.applyPlaylist(parsed);
         }
       } catch (error) {
+        if (generation !== this.generation) return;
         log("time machine playlist failed", error);
         this.stopCapture();
         this.source = null;
@@ -3952,7 +3991,7 @@
         this.variantUrl = "";
         this.resolveAt = performance.now() + 10_000;
       } finally {
-        this.pollBusy = false;
+        if (generation === this.generation) this.pollBusy = false;
       }
     },
 
@@ -3963,7 +4002,7 @@
         mapUri: segment.mapUri || mapUri
       }));
       this.segments = core.mergeTimeMachineSegments(this.segments, segments, {
-        maxAgeMs: TIME_MACHINE_MAX_SECONDS * 1000
+        maxAgeMs: this.limitSeconds * 1000
       });
       this.initUri = mapUri;
       this.schedulePersist();
@@ -4020,7 +4059,7 @@
       button.className = "cng-tm-toggle";
       button.textContent = "타임머신";
       button.setAttribute("aria-expanded", "false");
-      button.title = "페이지를 연 뒤 받은 구간을 최대 1시간까지 되감기";
+      button.title = `최근 ${this.limitSeconds / 60}분 중 방송 서버에 남아 있는 구간 되감기`;
       const stopPlayerEvent = (event) => event.stopPropagation();
       button.addEventListener("pointerdown", stopPlayerEvent);
       button.addEventListener("click", (event) => {
@@ -4185,21 +4224,37 @@
 
       const listeners = new AbortController();
       let startupTimer;
+      const clearWait = () => {
+        clearTimeout(startupTimer);
+        startupTimer = null;
+      };
       const fail = message => {
         if (this.overlayVideo !== overlayVideo || this.overlayFailed) return;
-        clearTimeout(startupTimer);
+        clearWait();
         this.overlayFailed = true;
         status.textContent = message;
       };
+      const watchWait = () => {
+        if (startupTimer || this.overlayFailed || this.overlayVideo !== overlayVideo) return;
+        startupTimer = setTimeout(() => {
+          clearWait();
+          if (this.overlayVideo !== overlayVideo || this.overlayFailed ||
+              (!overlayVideo.seeking && overlayVideo.readyState >= 2 && overlayVideo.videoWidth)) return;
+          fail("영상 응답이 늦어 요청을 중단했습니다. 같은 위치를 다시 선택할 수 있습니다.");
+          this.overlayHls?.stopLoad();
+        }, 12000);
+      };
+      overlayVideo.addEventListener("seeking", watchWait);
+      overlayVideo.addEventListener("waiting", watchWait);
       const firstFrame = () => {
-        if (this.overlayVideo !== overlayVideo || this.overlayFailed || overlayVideo.readyState < 2 || !overlayVideo.videoWidth) return;
-        clearTimeout(startupTimer);
+        if (this.overlayVideo !== overlayVideo || this.overlayFailed || overlayVideo.seeking || overlayVideo.readyState < 2 || !overlayVideo.videoWidth) return;
+        clearWait();
         if (status.textContent !== "재생 버튼을 눌러 주세요" || !overlayVideo.paused) status.textContent = "";
       };
-      for (const event of ["loadeddata", "canplay", "playing"]) overlayVideo.addEventListener(event, firstFrame);
+      for (const event of ["loadeddata", "canplay", "playing", "seeked"]) overlayVideo.addEventListener(event, firstFrame);
       overlayVideo.addEventListener("error", () => fail("과거 영상을 읽지 못했습니다. 다른 위치를 선택해 주세요."));
       const playReplay = () => overlayVideo.play().catch(error => {
-        if (error.name === "AbortError" || this.overlayVideo !== overlayVideo) return;
+        if (error.name === "AbortError" || this.overlayVideo !== overlayVideo || this.overlayFailed) return;
         if (error.name === "NotAllowedError") {
           status.textContent = "재생 버튼을 눌러 주세요";
         } else {
@@ -4223,6 +4278,7 @@
       }
       this.replayUi = {
         refresh: placeControls,
+        restartWait() { clearWait(); watchWait(); },
         remove() {
           clearTimeout(startupTimer);
           listeners.abort();
@@ -4239,11 +4295,7 @@
       this.overlayBaseTime = 0;
       this.overlayClockReady = false;
       this.overlayInitialElapsed = initialElapsed;
-      startupTimer = setTimeout(() => {
-        if (overlayVideo.readyState < 2 || !overlayVideo.videoWidth) {
-          if (!this.overlayFailed) status.textContent = "이 구간의 영상 응답이 늦습니다. 다른 위치나 실시간을 선택할 수 있습니다.";
-        }
-      }, 15000);
+      watchWait();
       this.removeUi();
       timelineAssist.tick();
 
@@ -4403,8 +4455,12 @@
       hls.on("hlsError", (event, data) => {
         if (this.overlayVideo !== overlayVideo || !data || this.overlayFailed) return;
         const unavailable = [403, 404, 410].includes(data.response?.code);
-        const targetUnavailable = unavailable && overlayVideo.readyState < 2 &&
-          data.details === "fragLoadError" && (data.frag?.sn === segmentRange.targetIndex || data.frag?.sn === "initSegment");
+        const sn = data.frag?.sn;
+        const elapsed = this.overlayInitialElapsed ?? (overlayVideo.currentTime - this.overlayBaseTime);
+        const start = segmentRange.offsets[sn];
+        const targetUnavailable = unavailable && (overlayVideo.seeking || overlayVideo.readyState < 2) &&
+          data.details === "fragLoadError" && (sn === "initSegment" ||
+            (Number.isFinite(start) && elapsed >= start && elapsed < start + segmentRange.segments[sn].duration));
         if (!data.fatal && !targetUnavailable) return;
         fail(unavailable
           ? "방송 서버에서 이 구간을 제공하지 않습니다. 다른 위치를 선택해 주세요."

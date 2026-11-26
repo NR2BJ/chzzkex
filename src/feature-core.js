@@ -21,7 +21,10 @@
   ]);
   const VISIBLE_CHAT_STATUSES = new Set(["NORMAL", "CANCEL"]);
   const TIME_MACHINE_MAX_SECONDS = 3600;
-  const TIME_MACHINE_MAX_SEGMENTS = 1200;
+  function replayLimitSeconds(detail) {
+    return detail?.timeMachineActive === true ? TIME_MACHINE_MAX_SECONDS : 11 * 60;
+  }
+  const TIME_MACHINE_MAX_SEGMENTS = TIME_MACHINE_MAX_SECONDS * 2;
 
   function clamp(value, minimum, maximum) {
     return Math.min(maximum, Math.max(minimum, value));
@@ -858,7 +861,7 @@
     const edgeMs = Math.max(...list.map((segment) => segment.endMs));
     const cutoff = edgeMs - Math.max(0, maxAgeMs);
     return list
-      .filter((segment) => segment.endMs >= cutoff)
+      .filter((segment) => segment.endMs > cutoff)
       .slice(-TIME_MACHINE_MAX_SEGMENTS);
   }
 
@@ -1089,6 +1092,7 @@
     mergeTimeMachineSegments,
     parseMasterPlaylist,
     parseMediaPlaylist,
+    replayLimitSeconds,
     selectMasterVariant,
     replayElapsed,
     replayTime,

@@ -590,6 +590,29 @@ test("merges overlapping time machine segments and drops old ones", () => {
   assert.equal(trimmed[0].sequence, 1436);
 });
 
+test("keeps a full hour of short segments without keeping earlier hours", () => {
+  for (const duration of [0.5, 1, 2, 4]) {
+    const hour = 3600 / duration;
+    const segments = Array.from({length: hour + 100}, (_, i) => ({
+      uri: "segment-" + i, startMs: i * duration * 1000,
+      endMs: (i + 1) * duration * 1000, duration
+    }));
+    const kept = core.mergeTimeMachineSegments([], segments);
+    assert.equal(kept.length, hour);
+    assert.equal(core.timeMachineAvailability(kept).availableSeconds, 3600);
+  }
+});
+
+test("sets the rewind scale from this broadcast's active flag, not its badge or viewer entitlement", () => {
+  for (const grade of ["PARTNER", "CHALLENGER"]) {
+    assert.equal(core.replayLimitSeconds({channel:{verifiedMarkType:grade}, timeMachineActive:false}),660);
+  }
+  assert.equal(core.replayLimitSeconds({timeMachineActive:true, timeMachinePlayback:false}),3600);
+  for (const detail of [null, {}, {timeMachinePlayback:true}, {timeMachineActive:false}, {timeMachineActive:"true"}, {channel:{verifiedMark:true}}]) {
+    assert.equal(core.replayLimitSeconds(detail),660);
+  }
+});
+
 test("spans cached blocks and stops replay windows at a gap", () => {
   const parsed = core.parseMediaPlaylist(TIME_MACHINE_PLAYLIST, TIME_MACHINE_BASE);
   const availability = core.timeMachineAvailability(parsed.segments);

@@ -18,8 +18,8 @@ async function request(url, body, method = body === undefined ? "GET" : "POST") 
   return value;
 }
 const evaluate = script => request("/session/" + session + "/execute/sync", { script, args: [] });
-async function wait(fn) {
-  for (let i = 0; i < 100; i++) {
+async function wait(fn, attempts = 100) {
+  for (let i = 0; i < attempts; i++) {
     const result = await fn();
     if (result) return result;
     await pause(100);
@@ -41,7 +41,7 @@ async function run() {
       "#EXT-X-PROGRAM-DATE-TIME:" + new Date(startMs + seconds * 1000).toISOString() + "\n" + segment;
   });
   assert.equal(index, 270);
-  let freshWindowOnly = false, denySegments = false;
+  let freshWindowOnly = false, denySegments = false, stallSegments = false;
   const tail = playlist.slice(0, playlist.indexOf("#EXT-X-PROGRAM-DATE-TIME:")) +
     playlist.slice(playlist.lastIndexOf("#EXT-X-PROGRAM-DATE-TIME:", playlist.indexOf("fixture249.m4s")));
   const scripts = ["hls.min.js", "settings.js", "feature-core.js", "features.js"];
@@ -61,7 +61,9 @@ async function run() {
     <button id="wide" onclick="this.closest('.pzp-pc').style.width='800px'">W</button>
     <button id="full" onclick="this.closest('.pzp-pc').requestFullscreen()">F</button></div></div></div>
     <script>const nativeFetch = window.fetch.bind(window);
-    window.fetch = (url, options) => String(url).includes("live-playback-json-meta") ?
+    window.fetch = (url, options) => String(url).includes("/channels/fixture/live-detail") ?
+      Promise.resolve(Response.json({content:{liveId:"fixture",timeMachineActive:!sessionStorage.shortRange,timeMachinePlayback:false,channel:{channelId:"fixture",verifiedMarkType:"PARTNER"}}})) :
+      String(url).includes("live-playback-json-meta") ?
       Promise.resolve(Response.json({code:200,content:{playbackJson:{meta:{liveId:"fixture"},live:{timeMachine:false},media:[{protocol:"HLS",path:location.origin+"/fixture.m3u8"}]}}})) : nativeFetch(url, options);
     </script>` + scripts.map(s => '<script src="/'+s+'"></script>').join("") +
     '<script>postMessage({source:"chzzk-ex",type:"settings",settings:{timelineAssist:true,timeMachine:true,watchTimer:true,videoLatency:true,normalizeVolume:true}},"*")</script>';
@@ -69,7 +71,8 @@ async function run() {
     const name = req.url.slice(1);
     if (name === "live/fixture") { res.setHeader("Content-Type", "text/html; charset=utf-8"); return res.end(html); }
     if (name === "fixture.m3u8") return res.end(freshWindowOnly ? tail : playlist);
-    if (denySegments && name.endsWith(".m4s")) {res.writeHead(410); return res.end();}
+    if (denySegments && name.endsWith(".m4s")) {res.writeHead(410,{"Cache-Control":"no-store"}); return res.end();}
+    if (stallSegments && name.endsWith(".m4s")) return;
     const file = scripts.includes(name) || name === "features.css" ? path.join(source, name) :
       /^(native\.mp4|init\.mp4|fixture\d+\.m4s)$/.test(name) ? path.join(tmp,name) : null;
     if (!file || !fs.existsSync(file)) {res.writeHead(404); return res.end();}
@@ -100,8 +103,8 @@ async function run() {
   await request("/session/"+session+"/refresh",{});
   await wait(async()=>(await state()).max===1080);
   await evaluate('document.body.dataset.overlays=0;new MutationObserver(records=>{for(const r of records)for(const n of r.addedNodes)if(n.matches?.(".cng-tm-overlay"))document.body.dataset.overlays=Number(document.body.dataset.overlays)+1;}).observe(document.body,{childList:true,subtree:true});');
-  async function mouse(type,behind) {
-    const {x,y}=await evaluate('const r=document.querySelector(".cng-timeline-assist__track").getBoundingClientRect();return {x:Math.round(r.right-r.width*'+behind+'/1080),y:Math.round(r.y+r.height/2)};');
+  async function mouse(type,behind,span=1080) {
+    const {x,y}=await evaluate('const r=document.querySelector(".cng-timeline-assist__track").getBoundingClientRect();return {x:Math.round(r.right-r.width*'+behind+'/'+span+'),y:Math.round(r.y+r.height/2)};');
     if(type==="click"||type==="down") await wait(()=>evaluate('return !!document.elementFromPoint('+x+','+y+')?.closest(".cng-timeline-assist__track")'));
     const actions=[{type:"pointerMove",x,y,duration:0}];
     if (type==="click"||type==="down") actions.push({type:"pointerDown",button:0});
@@ -216,7 +219,7 @@ async function run() {
     throw Error("대체 조작 종료 전후: "+JSON.stringify([beforeReturn,await fallbackAudio()]),{cause:e});
   }
   const beforeSnap = (await state()).overlayCount;
-  await evaluate('native.addEventListener("seeking",()=>{native.currentTime=88},{once:true})');
+  await evaluate('native.addEventListener("seeking",function snap(){if(native.currentTime>40)return;native.removeEventListener("seeking",snap);native.currentTime=86.5;})');
   await mouse("click",60);
   await playing(60,beforeSnap+1);
   await click(".cng-timeline-assist__live");
@@ -225,8 +228,30 @@ async function run() {
   try {
     await wait(async()=>/이 구간을|과거 영상을/.test((await state()).status||""));
   } catch(e) { throw Error("만료된 영상 응답: "+JSON.stringify(await state()),{cause:e}); }
+  denySegments=false;
+  stallSegments=true;
+  await mouse("click",700);
+  try {
+    await wait(async()=>/응답이 늦어 요청을 중단/.test((await state()).status||""),160);
+  } catch(e) { throw Error("응답 없는 구간: "+JSON.stringify(await state()),{cause:e}); }
+  stallSegments=false;
+  const beforeRetry=(await state()).overlayCount;
+  await mouse("click",700);
+  await playing(700,beforeRetry+1);
   await click(".cng-timeline-assist__live");
   await wait(()=>evaluate('return !document.querySelector(".cng-tm-overlay")'));
+  await evaluate('sessionStorage.shortRange="1"');
+  await request("/session/"+session+"/refresh",{});
+  await wait(async()=>(await state()).max===660);
+  await mouse("click",330,660);
+  await wait(async()=>{const s=await state();return s.ready>=2 && Math.abs(s.behind-330)<3 && Math.abs(s.pos-150)<3;});
+  await mouse("down",330,660);
+  await mouse("move",630,660);
+  await wait(async()=>Math.abs((await state()).behind-630)<2);
+  await mouse("up",630,660);
+  await wait(async()=>{const s=await state();return s.ready>=2 && Math.abs(s.behind-630)<3 && Math.abs(s.pos-30)<3;});
+  await evaluate('document.querySelector(".cng-timeline-assist__track").dispatchEvent(new KeyboardEvent("keydown",{key:"Home",bubbles:true}))');
+  await wait(async()=>{const s=await state();return s.ready>=2 && s.max===660 && Math.abs(s.behind-660)<3 && s.pos<3;});
   console.log("Firefox "+cap.capabilities.browserVersion+": 새로고침 뒤 과거 영상 표시, 가위·배속 숨김, 드래그, 구간 만료 안내, 기본 조작 및 음량 복귀 확인");
 }
 (async()=>{try{await run();}finally{
